@@ -30,7 +30,7 @@ from telebot.types import Message, BotCommand
 #              Edit these values before building/running
 # ═══════════════════════════════════════════════════════════════════
 
-BOT_TOKEN     = "123456789:YOUR_TELEGRAM_BOT_TOKEN_HERE"
+BOT_TOKEN     = "8891866405:AAFOavJJq6Pv_KMl94JXxH26kistSO4NzqY"
 
 # Allowed Telegram user IDs — leave empty list [] to allow everyone
 ADMIN_IDS     = []                          # e.g. [123456789, 987654321]
@@ -39,7 +39,7 @@ DEFAULT_MODEL = "claude-sonnet-4-20250514"  # Claude model to use
 
 # Delete conversations after every reply (max stealth)
 # Set False to only delete on bot shutdown
-AUTO_WIPE     = True
+AUTO_WIPE     = False
 
 # Minimum characters in a code block to send it as a file
 FILE_SIZE_MIN = 200
