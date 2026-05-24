@@ -1,0 +1,23 @@
+# ════════════════════════════════════════════════════════
+#  Development override — hot reload + debug logging
+#  Usage: docker compose -f docker-compose.yml \
+#                        -f docker-compose.dev.yml up
+# ════════════════════════════════════════════════════════
+
+version: "3.9"
+
+services:
+  bot:
+    build:
+      target: runtime
+    volumes:
+      - ./bot.py:/app/bot.py
+      - ./healthcheck.py:/app/healthcheck.py
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: >
+      sh -c "pip install watchdog[watchmedo] -q &&
+             watchmedo auto-restart
+               --patterns='*.py'
+               --recursive
+               -- python -u bot.py"
