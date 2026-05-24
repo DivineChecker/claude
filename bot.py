@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""
+🕵️ Claude Incognito Telegram Bot
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Docker-ready — all config hardcoded below.
+⚠️ UNOFFICIAL — Uses claude.ai web API. May break at any time.
+"""
 
 import json
 import uuid
@@ -24,7 +30,7 @@ from telebot.types import Message, BotCommand
 #              Edit these values before building/running
 # ═══════════════════════════════════════════════════════════════════
 
-BOT_TOKEN     = "8891866405:AAFOavJJq6Pv_KMl94JXxH26kistSO4NzqY"
+BOT_TOKEN     = "123456789:YOUR_TELEGRAM_BOT_TOKEN_HERE"
 
 # Allowed Telegram user IDs — leave empty list [] to allow everyone
 ADMIN_IDS     = []                          # e.g. [123456789, 987654321]
@@ -33,7 +39,7 @@ DEFAULT_MODEL = "claude-sonnet-4-20250514"  # Claude model to use
 
 # Delete conversations after every reply (max stealth)
 # Set False to only delete on bot shutdown
-AUTO_WIPE     = False
+AUTO_WIPE     = True
 
 # Minimum characters in a code block to send it as a file
 FILE_SIZE_MIN = 200
@@ -49,18 +55,6 @@ LOG_LEVEL     = "INFO"
 # ═══════════════════════════════════════════════════════════════════
 
 BASE_URL = "https://claude.ai/api"
-
-COMMON_HEADERS = {
-    "User-Agent"  : (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept"      : "text/event-stream",
-    "Content-Type": "application/json",
-    "Origin"      : "https://claude.ai",
-    "Referer"     : "https://claude.ai/chats",
-}
 
 # ── Logging setup ─────────────────────────────────────────────────
 os.makedirs("/app/logs", exist_ok=True)
@@ -105,7 +99,17 @@ class UserSession:
     busy            : bool = False
 
     def __post_init__(self):
-        self.http.headers.update(COMMON_HEADERS)
+        self.http.headers.update({
+            "User-Agent"  : (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept"      : "text/event-stream",
+            "Content-Type": "application/json",
+            "Origin"      : "https://claude.ai",
+            "Referer"     : "https://claude.ai/chats",
+        })
 
     def set_key(self, key: str):
         self.session_key = key
@@ -128,22 +132,64 @@ def get_session(uid: int) -> UserSession:
 
 def validate_key(session_key: str) -> tuple[bool, str, str]:
     """
-    Validate a Claude session key using full browser headers.
+    Validate a Claude session key.
     Returns (is_valid, org_id, org_name_or_error).
     """
+    # Create a proper session with full headers
     s = requests.Session()
-    s.headers.update(COMMON_HEADERS)
+    s.headers.update({
+        "User-Agent"  : (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept"      : "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+        "Origin"      : "https://claude.ai",
+        "Referer"     : "https://claude.ai/chats",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    })
     s.cookies.set("sessionKey", session_key, domain="claude.ai")
+    
     try:
+        log.debug(f"Validating key: {session_key[:20]}...")
         resp = s.get(f"{BASE_URL}/organizations", timeout=15)
+        
+        log.debug(f"Validation response: {resp.status_code}")
+        
         if resp.status_code == 403:
+            log.warning("Got 403 - key is expired or invalid")
             return (False, "", "Expired / Invalid")
+        
+        if resp.status_code == 401:
+            log.warning("Got 401 - unauthorized")
+            return (False, "", "Unauthorized / Invalid Key")
+            
         resp.raise_for_status()
         orgs = resp.json()
+        
+        log.debug(f"Organizations response: {orgs}")
+        
         if not orgs:
             return (False, "", "No organizations found")
-        return (True, orgs[0]["uuid"], orgs[0].get("name", "OK"))
+            
+        org_name = orgs[0].get("name", "Unknown Organization")
+        org_id = orgs[0]["uuid"]
+        
+        log.info(f"Key validated successfully for org: {org_name}")
+        return (True, org_id, org_name)
+        
+    except requests.exceptions.Timeout:
+        log.error("Validation request timed out")
+        return (False, "", "Request timed out")
+    except requests.exceptions.ConnectionError:
+        log.error("Connection error during validation")
+        return (False, "", "Connection error")
     except Exception as e:
+        log.error(f"Validation error: {e}")
         return (False, "", str(e))
 
 
@@ -157,6 +203,7 @@ def create_conversation(us: UserSession) -> str:
     us.conversation_id = cid
     us.tracked_convs.append(cid)
     us.history = []
+    log.info(f"Created conversation: {cid[:12]}...")
     return cid
 
 
@@ -170,6 +217,7 @@ def delete_conversation(us: UserSession, conv_id: str) -> bool:
         r = us.http.delete(url, timeout=10)
         if conv_id in us.tracked_convs:
             us.tracked_convs.remove(conv_id)
+        log.debug(f"Deleted conversation: {conv_id[:12]}...")
         return r.ok or r.status_code == 204
     except Exception:
         return False
@@ -177,10 +225,12 @@ def delete_conversation(us: UserSession, conv_id: str) -> bool:
 
 def wipe_all(us: UserSession):
     """Delete every tracked conversation for this user."""
+    count = len(us.tracked_convs)
     for cid in list(us.tracked_convs):
         delete_conversation(us, cid)
     us.conversation_id = ""
     us.history = []
+    log.info(f"Wiped {count} conversation(s)")
 
 
 def send_message(us: UserSession, text: str, attachments: list = None) -> dict:
@@ -488,14 +538,14 @@ Chat with Claude — all conversations <b>auto-deleted</b> (incognito).
 
 <b>━━━ Setup ━━━</b>
 /setkey <code>&lt;session_key&gt;</code> — Set your Claude session key
-/validate — Check your current key
-/massvalidate — Bulk validate keys
+/validate — Check if your current key still works
+/massvalidate — Bulk validate multiple keys
 
 <b>━━━ Chat ━━━</b>
-Just send any message! Send files/images too.
+Just send any message! Files and images supported.
 
 <b>━━━ Controls ━━━</b>
-/newchat   — Fresh conversation
+/newchat   — Start fresh conversation
 /model     — Change Claude model
 /incognito — Toggle incognito mode
 /wipe      — Delete all tracked chats
@@ -503,9 +553,12 @@ Just send any message! Send files/images too.
 /myid      — Show your Telegram user ID
 
 <b>━━━ Get Session Key ━━━</b>
-1. Login at <a href="https://claude.ai">claude.ai</a>
-2. F12 → Application → Cookies
-3. Copy <code>sessionKey</code> value
+1. Go to <a href="https://claude.ai">claude.ai</a>
+2. Login to your account
+3. Press F12 → Application → Cookies
+4. Find <code>sessionKey</code> cookie
+5. Copy the value (starts with sk-ant-sid01-)
+6. Send: /setkey &lt;paste_here&gt;
 """.strip(), parse_mode="HTML", disable_web_page_preview=True)
 
 
@@ -527,8 +580,13 @@ def cmd_setkey(msg: Message):
     if len(parts) < 2 or not parts[1].strip():
         bot.reply_to(
             msg,
-            "Usage: /setkey <code>&lt;session_key&gt;</code>",
+            "⚠️ <b>Usage:</b> /setkey <code>&lt;your_session_key&gt;</code>\n\n"
+            "Get your key from:\n"
+            "1. <a href='https://claude.ai'>claude.ai</a> → Login\n"
+            "2. F12 → Application → Cookies\n"
+            "3. Copy <code>sessionKey</code> value",
             parse_mode="HTML",
+            disable_web_page_preview=True,
         )
         return
 
@@ -539,10 +597,12 @@ def cmd_setkey(msg: Message):
     # Delete message immediately — it contains the secret key
     try:
         bot.delete_message(msg.chat.id, msg.message_id)
-    except Exception:
-        pass
+        log.info(f"Deleted /setkey message from user {uid} for security")
+    except Exception as e:
+        log.warning(f"Could not delete /setkey message: {e}")
 
-    thinking = bot.send_message(msg.chat.id, "🔄 Validating key…")
+    thinking = bot.send_message(msg.chat.id, "🔄 <i>Validating your key...</i>", parse_mode="HTML")
+    
     valid, org_id, info = validate_key(key)
 
     try:
@@ -553,25 +613,34 @@ def cmd_setkey(msg: Message):
     if not valid:
         bot.send_message(
             msg.chat.id,
-            f"❌ <b>Invalid Key</b>\n<code>{html_lib.escape(info)}</code>",
+            f"❌ <b>Invalid Session Key</b>\n\n"
+            f"Error: <code>{html_lib.escape(info)}</code>\n\n"
+            f"<b>Troubleshooting:</b>\n"
+            f"• Make sure you copied the FULL key\n"
+            f"• Key should start with <code>sk-ant-sid01-</code>\n"
+            f"• Try getting a fresh key from claude.ai\n"
+            f"• Make sure you're logged in to claude.ai",
             parse_mode="HTML",
         )
         return
 
-    if us.organization_id:
+    # Wipe old conversations if switching keys
+    if us.organization_id and us.organization_id != org_id:
         wipe_all(us)
+        log.info(f"User {uid} switched organizations, wiped old conversations")
 
     us.set_key(key)
     us.organization_id = org_id
-    log.info(f"User {uid} set a valid key for org: {info}")
+    log.info(f"User {uid} successfully set key for org: {info}")
 
     bot.send_message(
         msg.chat.id,
-        f"✅ <b>Key Set Successfully!</b>\n"
-        f"🏢 Org   : <code>{html_lib.escape(info)}</code>\n"
-        f"🕵️ Mode  : <b>{'Incognito ON' if us.incognito else 'Incognito OFF'}</b>\n"
-        f"🤖 Model : <code>{us.model}</code>\n\n"
-        f"<i>🔐 Your key message was auto-deleted.</i>",
+        f"✅ <b>Session Key Configured!</b>\n\n"
+        f"🏢 Organization: <code>{html_lib.escape(info)}</code>\n"
+        f"🕵️ Incognito: <b>{'ON' if us.incognito else 'OFF'}</b>\n"
+        f"🤖 Model: <code>{us.model}</code>\n\n"
+        f"<i>🔐 Your key message was deleted for security.</i>\n\n"
+        f"Start chatting now! Just send any message.",
         parse_mode="HTML",
     )
 
@@ -583,7 +652,10 @@ def cmd_setkey(msg: Message):
 def cmd_validate(msg: Message):
     us = get_session(msg.from_user.id)
     if not us.session_key:
-        bot.reply_to(msg, "⚠️ No key set. Use /setkey first.")
+        bot.reply_to(msg, 
+            "⚠️ <b>No session key configured</b>\n\n"
+            "Use /setkey first to set your Claude session key.",
+            parse_mode="HTML")
         return
 
     bot.send_chat_action(msg.chat.id, "typing")
@@ -592,13 +664,17 @@ def cmd_validate(msg: Message):
     if valid:
         bot.reply_to(
             msg,
-            f"✅ <b>Key valid!</b>\n🏢 {html_lib.escape(info)}",
+            f"✅ <b>Session Key is Valid!</b>\n\n"
+            f"🏢 Organization: <code>{html_lib.escape(info)}</code>\n"
+            f"✨ Your key is working correctly.",
             parse_mode="HTML",
         )
     else:
         bot.reply_to(
             msg,
-            f"❌ <b>Key invalid/expired</b>\n{html_lib.escape(info)}",
+            f"❌ <b>Session Key Expired or Invalid</b>\n\n"
+            f"Error: <code>{html_lib.escape(info)}</code>\n\n"
+            f"Use /setkey to configure a new key.",
             parse_mode="HTML",
         )
 
@@ -613,9 +689,11 @@ def cmd_massvalidate(msg: Message):
         bot.reply_to(
             msg,
             "📋 <b>Mass Key Validator</b>\n\n"
-            "Usage:\n<code>/massvalidate\n"
+            "Paste multiple session keys, one per line:\n\n"
+            "<code>/massvalidate\n"
             "sk-ant-sid01-key1...\n"
-            "sk-ant-sid01-key2...</code>",
+            "sk-ant-sid01-key2...\n"
+            "sk-ant-sid01-key3...</code>",
             parse_mode="HTML",
         )
         return
@@ -644,11 +722,11 @@ def cmd_massvalidate(msg: Message):
 
         if valid:
             results_valid.append(
-                f"  ✅ <code>{html_lib.escape(short)}</code> → {html_lib.escape(info)}"
+                f"  ✅ <code>{html_lib.escape(short)}</code>\n     → {html_lib.escape(info)}"
             )
         else:
             results_invalid.append(
-                f"  ❌ <code>{html_lib.escape(short)}</code> → {html_lib.escape(info)}"
+                f"  ❌ <code>{html_lib.escape(short)}</code>\n     → {html_lib.escape(info)}"
             )
 
         if (i + 1) % 3 == 0 or i == total - 1:
@@ -665,12 +743,12 @@ def cmd_massvalidate(msg: Message):
     report = (
         f"📊 <b>Mass Validation Report</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Total : {total}  ✅ {len(results_valid)}  ❌ {len(results_invalid)}\n\n"
+        f"Total: {total}  |  ✅ {len(results_valid)}  |  ❌ {len(results_invalid)}\n\n"
     )
     if results_valid:
-        report += "<b>✅ Valid:</b>\n" + "\n".join(results_valid) + "\n\n"
+        report += "<b>✅ Valid Keys:</b>\n" + "\n".join(results_valid) + "\n\n"
     if results_invalid:
-        report += "<b>❌ Invalid:</b>\n" + "\n".join(results_invalid)
+        report += "<b>❌ Invalid Keys:</b>\n" + "\n".join(results_invalid)
 
     try:
         bot.delete_message(status_msg.chat.id, status_msg.message_id)
@@ -678,7 +756,7 @@ def cmd_massvalidate(msg: Message):
         pass
 
     send_chunked(msg.chat.id, report.strip())
-    log.info(f"Mass validate: {len(results_valid)}/{total} valid")
+    log.info(f"Mass validate completed: {len(results_valid)}/{total} valid")
 
 
 # ── New Chat ───────────────────────────────────────────────────────
@@ -688,7 +766,7 @@ def cmd_massvalidate(msg: Message):
 def cmd_newchat(msg: Message):
     us = get_session(msg.from_user.id)
     if not us.session_key or not us.organization_id:
-        bot.reply_to(msg, "⚠️ No key set. Use /setkey first.")
+        bot.reply_to(msg, "⚠️ No session key configured. Use /setkey first.")
         return
 
     if us.conversation_id:
@@ -698,7 +776,7 @@ def cmd_newchat(msg: Message):
     us.history = []
     bot.reply_to(
         msg,
-        "🆕 <b>New conversation started!</b>\n<i>Previous chat deleted.</i>",
+        "🆕 <b>New conversation started!</b>\n<i>Previous chat was deleted.</i>",
         parse_mode="HTML",
     )
 
@@ -714,11 +792,11 @@ def cmd_model(msg: Message):
     if len(parts) < 2:
         bot.reply_to(
             msg,
-            f"🤖 Current: <code>{us.model}</code>\n\n"
-            "<b>Available:</b>\n"
-            "• <code>claude-sonnet-4-20250514</code>\n"
+            f"🤖 Current model: <code>{us.model}</code>\n\n"
+            "<b>Available models:</b>\n"
+            "• <code>claude-sonnet-4-20250514</code> (latest, best)\n"
             "• <code>claude-3-5-sonnet-20241022</code>\n"
-            "• <code>claude-3-5-haiku-20241022</code>\n"
+            "• <code>claude-3-5-haiku-20241022</code> (fast)\n"
             "• <code>claude-3-opus-20240229</code>\n\n"
             "Usage: /model <code>&lt;model_name&gt;</code>",
             parse_mode="HTML",
@@ -726,7 +804,7 @@ def cmd_model(msg: Message):
         return
 
     us.model = parts[1].strip()
-    bot.reply_to(msg, f"✅ Model → <code>{us.model}</code>", parse_mode="HTML")
+    bot.reply_to(msg, f"✅ Model changed to: <code>{us.model}</code>", parse_mode="HTML")
 
 
 # ── Incognito Toggle ───────────────────────────────────────────────
@@ -739,11 +817,13 @@ def cmd_incognito(msg: Message):
     state        = "ON 🟢" if us.incognito else "OFF 🔴"
     bot.reply_to(
         msg,
-        f"🕵️ Incognito: <b>{state}</b>\n"
+        f"🕵️ Incognito mode: <b>{state}</b>\n\n"
         + (
-            "<i>Chats deleted after each reply.</i>"
+            "<i>✅ All conversations will be deleted after each reply.\n"
+            "No trace left in your claude.ai history.</i>"
             if us.incognito else
-            "<i>Chats will persist on claude.ai.</i>"
+            "<i>⚠️ Conversations will remain on claude.ai.\n"
+            "They will only be deleted when you stop the bot.</i>"
         ),
         parse_mode="HTML",
     )
@@ -756,8 +836,11 @@ def cmd_incognito(msg: Message):
 def cmd_wipe(msg: Message):
     us    = get_session(msg.from_user.id)
     count = len(us.tracked_convs)
+    if count == 0:
+        bot.reply_to(msg, "ℹ️ No conversations to delete.", parse_mode="HTML")
+        return
     wipe_all(us)
-    bot.reply_to(msg, f"🧹 Wiped <b>{count}</b> conversation(s).", parse_mode="HTML")
+    bot.reply_to(msg, f"🧹 Deleted <b>{count}</b> conversation(s) from claude.ai.", parse_mode="HTML")
 
 
 # ── Status ─────────────────────────────────────────────────────────
@@ -774,10 +857,10 @@ def cmd_status(msg: Message):
         msg,
         f"📊 <b>Session Status</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🔑 Key      : {'✅ Set' if us.session_key else '❌ Not set'}\n"
+        f"🔑 Key      : {'✅ Configured' if us.session_key else '❌ Not set'}\n"
         f"🕵️ Incognito : {'🟢 ON' if us.incognito else '🔴 OFF'}\n"
         f"🤖 Model    : <code>{us.model}</code>\n"
-        f"💬 Conv     : {conv}\n"
+        f"💬 Current  : {conv}\n"
         f"📋 Tracked  : {len(us.tracked_convs)} conv(s)\n"
         f"💾 History  : {len(us.history)} msg(s)\n"
         f"🐳 Docker   : ✅ Running",
@@ -798,9 +881,10 @@ def handle_message(msg: Message):
     if not us.session_key or not us.organization_id:
         bot.reply_to(
             msg,
-            "⚠️ <b>No session key!</b>\n"
-            "Use /setkey <code>&lt;key&gt;</code>\n"
-            "See /help for instructions.",
+            "⚠️ <b>No session key configured!</b>\n\n"
+            "Please set your Claude session key first:\n"
+            "/setkey <code>&lt;your_key&gt;</code>\n\n"
+            "See /help for detailed instructions.",
             parse_mode="HTML",
         )
         return
@@ -808,7 +892,7 @@ def handle_message(msg: Message):
     if us.busy:
         bot.reply_to(
             msg,
-            "⏳ <i>Still processing previous message…</i>",
+            "⏳ <i>Please wait — still processing your previous message…</i>",
             parse_mode="HTML",
         )
         return
@@ -825,9 +909,11 @@ def handle_message(msg: Message):
             try:
                 content    = fdata.decode("utf-8")
                 user_text += f"\n\n[File: {fname}]\n```\n{content}\n```"
+                log.info(f"User {uid} uploaded text file: {fname}")
             except UnicodeDecodeError:
                 b64        = base64.b64encode(fdata).decode()
-                user_text += f"\n\n[Binary file: {fname}]\n{b64[:2000]}…"
+                user_text += f"\n\n[Binary file: {fname}, {len(fdata)} bytes]\n{b64[:2000]}…"
+                log.info(f"User {uid} uploaded binary file: {fname}")
         except Exception as e:
             bot.reply_to(msg, f"⚠️ Could not process file: {e}")
             return
@@ -838,7 +924,8 @@ def handle_message(msg: Message):
             finfo      = bot.get_file(msg.photo[-1].file_id)
             fdata      = bot.download_file(finfo.file_path)
             b64        = base64.b64encode(fdata).decode()
-            user_text += f"\n\n[Image attached — base64: {b64[:3000]}…]"
+            user_text += f"\n\n[Image attached — base64 preview: {b64[:3000]}…]"
+            log.info(f"User {uid} uploaded image")
         except Exception as e:
             bot.reply_to(msg, f"⚠️ Could not process image: {e}")
 
@@ -856,7 +943,7 @@ def handle_message(msg: Message):
 
         if not resp_text.strip():
             bot.edit_message_text(
-                "⚠️ <i>Empty response from Claude.</i>",
+                "⚠️ <i>Claude sent an empty response.</i>",
                 chat_id    = thinking.chat.id,
                 message_id = thinking.message_id,
                 parse_mode = "HTML",
@@ -873,18 +960,18 @@ def handle_message(msg: Message):
         if files:
             send_files(msg.chat.id, files, reply_to=msg.message_id)
 
-        us.history.append({"role": "user",     "text": user_text[:200]})
+        us.history.append({"role": "user",      "text": user_text[:200]})
         us.history.append({"role": "assistant", "text": resp_text[:200]})
-        log.info(f"User {uid} → {len(resp_text)} chars, {len(files)} file(s)")
+        log.info(f"User {uid} → response: {len(resp_text)} chars, {len(files)} file(s)")
 
     except requests.exceptions.HTTPError as e:
         code = e.response.status_code if e.response is not None else "?"
         msgs = {
-            403: "🔑 Session key expired. Use /setkey to update.",
-            429: "⏳ Rate limited — wait a moment and try again.",
-            500: "💥 Claude server error. Try again later.",
+            403: "🔑 Session key expired. Please use /setkey to set a new one.",
+            429: "⏳ Rate limited by Claude. Please wait and try again.",
+            500: "💥 Claude server error. Try again in a moment.",
         }
-        err = msgs.get(code, f"HTTP {code} error")
+        err = msgs.get(code, f"HTTP {code} error occurred")
         try:
             bot.edit_message_text(
                 f"❌ <b>Error:</b> {err}",
@@ -894,18 +981,18 @@ def handle_message(msg: Message):
             )
         except Exception:
             bot.send_message(msg.chat.id, f"❌ {err}")
-        log.error(f"HTTP {code} for user {uid}")
+        log.error(f"HTTP {code} error for user {uid}")
 
     except RuntimeError as e:
         try:
             bot.edit_message_text(
-                f"❌ <b>Claude Error:</b> {html_lib.escape(str(e))}",
+                f"❌ <b>Claude Error:</b>\n{html_lib.escape(str(e))}",
                 chat_id    = thinking.chat.id,
                 message_id = thinking.message_id,
                 parse_mode = "HTML",
             )
         except Exception:
-            bot.send_message(msg.chat.id, f"❌ {e}")
+            bot.send_message(msg.chat.id, f"❌ Claude error: {e}")
 
     except Exception as e:
         log.exception(f"Unhandled error for user {uid}")
@@ -927,7 +1014,7 @@ def handle_message(msg: Message):
 # ═══════════════════════════════════════════════════════════════════
 
 def graceful_shutdown(sig, frame):
-    log.info("Shutdown signal — wiping all incognito sessions…")
+    log.info("Shutdown signal received — cleaning up incognito sessions…")
     wiped = 0
     for uid, us in sessions.items():
         if us.tracked_convs:
@@ -935,7 +1022,7 @@ def graceful_shutdown(sig, frame):
             wipe_all(us)
             wiped += count
             log.info(f"  Wiped {count} conv(s) for user {uid}")
-    log.info(f"✓ Wiped {wiped} total. Goodbye.")
+    log.info(f"✓ Cleanup complete. Wiped {wiped} total conversations. Goodbye.")
     sys.exit(0)
 
 
@@ -948,25 +1035,27 @@ signal.signal(signal.SIGTERM, graceful_shutdown)
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    log.info("Registering bot commands…")
+    log.info("Setting up bot commands menu…")
     try:
         bot.set_my_commands([
             BotCommand("start",        "Welcome & help"),
-            BotCommand("setkey",       "Set Claude session key"),
-            BotCommand("newchat",      "Start fresh conversation"),
+            BotCommand("setkey",       "Set your Claude session key"),
+            BotCommand("newchat",      "Start a fresh conversation"),
             BotCommand("model",        "Change Claude model"),
-            BotCommand("validate",     "Validate current key"),
-            BotCommand("massvalidate", "Bulk validate keys"),
+            BotCommand("validate",     "Check if your key still works"),
+            BotCommand("massvalidate", "Bulk validate multiple keys"),
             BotCommand("incognito",    "Toggle incognito mode"),
-            BotCommand("wipe",         "Delete all tracked chats"),
-            BotCommand("status",       "Session info"),
+            BotCommand("wipe",         "Delete all tracked conversations"),
+            BotCommand("status",       "Show session info"),
             BotCommand("myid",         "Get your Telegram user ID"),
             BotCommand("help",         "Show help"),
         ])
+        log.info("✓ Bot commands registered successfully")
     except Exception as e:
-        log.warning(f"Could not set bot commands: {e}")
+        log.warning(f"Could not register bot commands: {e}")
 
-    log.info("🚀 Bot is polling…")
+    log.info("🚀 Bot is now polling for messages…")
+    log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
 
