@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import json
 import uuid
 import re
@@ -49,6 +50,18 @@ LOG_LEVEL     = "INFO"
 
 BASE_URL = "https://claude.ai/api"
 
+COMMON_HEADERS = {
+    "User-Agent"  : (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept"      : "text/event-stream",
+    "Content-Type": "application/json",
+    "Origin"      : "https://claude.ai",
+    "Referer"     : "https://claude.ai/chats",
+}
+
 # ── Logging setup ─────────────────────────────────────────────────
 os.makedirs("/app/logs", exist_ok=True)
 
@@ -92,17 +105,7 @@ class UserSession:
     busy            : bool = False
 
     def __post_init__(self):
-        self.http.headers.update({
-            "User-Agent"  : (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept"      : "text/event-stream",
-            "Content-Type": "application/json",
-            "Origin"      : "https://claude.ai",
-            "Referer"     : "https://claude.ai/chats",
-        })
+        self.http.headers.update(COMMON_HEADERS)
 
     def set_key(self, key: str):
         self.session_key = key
@@ -124,8 +127,12 @@ def get_session(uid: int) -> UserSession:
 # ═══════════════════════════════════════════════════════════════════
 
 def validate_key(session_key: str) -> tuple[bool, str, str]:
+    """
+    Validate a Claude session key using full browser headers.
+    Returns (is_valid, org_id, org_name_or_error).
+    """
     s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
+    s.headers.update(COMMON_HEADERS)
     s.cookies.set("sessionKey", session_key, domain="claude.ai")
     try:
         resp = s.get(f"{BASE_URL}/organizations", timeout=15)
@@ -141,6 +148,7 @@ def validate_key(session_key: str) -> tuple[bool, str, str]:
 
 
 def create_conversation(us: UserSession) -> str:
+    """Create a new blank incognito conversation."""
     url     = f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations"
     payload = {"uuid": str(uuid.uuid4()), "name": "", "model": us.model}
     resp    = us.http.post(url, json=payload, timeout=15)
@@ -153,6 +161,7 @@ def create_conversation(us: UserSession) -> str:
 
 
 def delete_conversation(us: UserSession, conv_id: str) -> bool:
+    """Silently delete a conversation by ID."""
     url = (
         f"{BASE_URL}/organizations/{us.organization_id}"
         f"/chat_conversations/{conv_id}"
@@ -167,6 +176,7 @@ def delete_conversation(us: UserSession, conv_id: str) -> bool:
 
 
 def wipe_all(us: UserSession):
+    """Delete every tracked conversation for this user."""
     for cid in list(us.tracked_convs):
         delete_conversation(us, cid)
     us.conversation_id = ""
@@ -174,6 +184,10 @@ def wipe_all(us: UserSession):
 
 
 def send_message(us: UserSession, text: str, attachments: list = None) -> dict:
+    """
+    Send a message to Claude and stream the full response.
+    Returns { 'text': str, 'files': list }
+    """
     if not us.conversation_id:
         create_conversation(us)
 
@@ -221,38 +235,39 @@ def send_message(us: UserSession, text: str, attachments: list = None) -> dict:
 # ═══════════════════════════════════════════════════════════════════
 
 LANG_EXTENSIONS = {
-    "python": ".py",    "py": ".py",
-    "javascript": ".js","js": ".js",
-    "typescript": ".ts","ts": ".ts",
-    "java": ".java",    "c": ".c",
-    "cpp": ".cpp",      "c++": ".cpp",
-    "csharp": ".cs",    "cs": ".cs",
-    "go": ".go",        "rust": ".rs",
-    "ruby": ".rb",      "php": ".php",
-    "swift": ".swift",  "kotlin": ".kt",
-    "scala": ".scala",  "html": ".html",
-    "css": ".css",      "scss": ".scss",
-    "sql": ".sql",      "bash": ".sh",
-    "sh": ".sh",        "shell": ".sh",
-    "zsh": ".sh",       "yaml": ".yaml",
-    "yml": ".yaml",     "toml": ".toml",
-    "json": ".json",    "xml": ".xml",
-    "markdown": ".md",  "md": ".md",
+    "python": ".py",      "py": ".py",
+    "javascript": ".js",  "js": ".js",
+    "typescript": ".ts",  "ts": ".ts",
+    "java": ".java",      "c": ".c",
+    "cpp": ".cpp",        "c++": ".cpp",
+    "csharp": ".cs",      "cs": ".cs",
+    "go": ".go",          "rust": ".rs",
+    "ruby": ".rb",        "php": ".php",
+    "swift": ".swift",    "kotlin": ".kt",
+    "scala": ".scala",    "html": ".html",
+    "css": ".css",        "scss": ".scss",
+    "sql": ".sql",        "bash": ".sh",
+    "sh": ".sh",          "shell": ".sh",
+    "zsh": ".sh",         "yaml": ".yaml",
+    "yml": ".yaml",       "toml": ".toml",
+    "json": ".json",      "xml": ".xml",
+    "markdown": ".md",    "md": ".md",
     "dockerfile": "Dockerfile",
     "docker": "Dockerfile",
     "makefile": "Makefile",
-    "r": ".r",          "lua": ".lua",
-    "perl": ".pl",      "dart": ".dart",
-    "vue": ".vue",      "svelte": ".svelte",
-    "jsx": ".jsx",      "tsx": ".tsx",
+    "r": ".r",            "lua": ".lua",
+    "perl": ".pl",        "dart": ".dart",
+    "vue": ".vue",        "svelte": ".svelte",
+    "jsx": ".jsx",        "tsx": ".tsx",
     "graphql": ".graphql",
-    "proto": ".proto",  "tf": ".tf",
-    "powershell": ".ps1","ps1": ".ps1",
+    "proto": ".proto",    "tf": ".tf",
+    "powershell": ".ps1", "ps1": ".ps1",
     "bat": ".bat",
 }
 
 
 def extract_code_files(text: str) -> list:
+    """Extract code blocks from response and return as sendable files."""
     pattern = r"```(\w+)?\n(.*?)```"
     matches = re.findall(pattern, text, re.DOTALL)
     files   = []
@@ -272,6 +287,7 @@ def extract_code_files(text: str) -> list:
 
 
 def guess_filename(code: str, lang: str) -> Optional[str]:
+    """Try to guess a meaningful filename from the code content."""
     ext = LANG_EXTENSIONS.get(lang, f".{lang}")
 
     if lang in ("python", "py"):
@@ -300,6 +316,7 @@ def guess_filename(code: str, lang: str) -> Optional[str]:
 # ═══════════════════════════════════════════════════════════════════
 
 def md_to_tg_html(text: str) -> str:
+    """Convert Claude's Markdown output to Telegram-safe HTML."""
     chunks        = []
     pos           = 0
     code_block_re = re.compile(r"```(\w+)?\n(.*?)```", re.DOTALL)
@@ -319,6 +336,7 @@ def md_to_tg_html(text: str) -> str:
 
 
 def _convert_inline(text: str) -> str:
+    """Convert inline markdown elements to Telegram HTML."""
     text = html_lib.escape(text)
     text = re.sub(r"`([^`\n]+)`",               r"<code>\1</code>",     text)
     text = re.sub(r"\*\*(.+?)\*\*",             r"<b>\1</b>",           text, flags=re.DOTALL)
@@ -335,6 +353,10 @@ def _convert_inline(text: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 def smart_split(text: str, max_len: int = MAX_CHUNK) -> list[str]:
+    """
+    Intelligently split a long message into Telegram-safe chunks.
+    Respects code blocks, paragraphs, and lines.
+    """
     if len(text) <= max_len:
         return [text]
 
@@ -366,6 +388,7 @@ def smart_split(text: str, max_len: int = MAX_CHUNK) -> list[str]:
 
 
 def _fix_unclosed_tags(chunk: str) -> str:
+    """Close any HTML tags that were split across chunks."""
     for open_tag, close_tag in [
         ("<pre>",  "</pre>"),
         ("<code>", "</code>"),
@@ -383,6 +406,7 @@ def _fix_unclosed_tags(chunk: str) -> str:
 
 
 def send_chunked(chat_id: int, text: str, reply_to: int = None):
+    """Send a long message split into smart chunks."""
     chunks = smart_split(text)
     total  = len(chunks)
 
@@ -410,6 +434,7 @@ def send_chunked(chat_id: int, text: str, reply_to: int = None):
 
 
 def send_files(chat_id: int, files: list, reply_to: int = None):
+    """Send extracted code blocks as downloadable Telegram files."""
     for f in files:
         try:
             bio      = io.BytesIO(f["content"].encode("utf-8"))
@@ -848,8 +873,8 @@ def handle_message(msg: Message):
         if files:
             send_files(msg.chat.id, files, reply_to=msg.message_id)
 
-        us.history.append({"role": "user",      "text": user_text[:200]})
-        us.history.append({"role": "assistant",  "text": resp_text[:200]})
+        us.history.append({"role": "user",     "text": user_text[:200]})
+        us.history.append({"role": "assistant", "text": resp_text[:200]})
         log.info(f"User {uid} → {len(resp_text)} chars, {len(files)} file(s)")
 
     except requests.exceptions.HTTPError as e:
