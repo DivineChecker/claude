@@ -99,21 +99,41 @@ class UserSession:
     busy            : bool = False
 
     def __post_init__(self):
+        """Initialize session with full browser-like headers."""
         self.http.headers.update({
-            "User-Agent"  : (
+            "User-Agent"           : (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            "Accept"      : "text/event-stream",
-            "Content-Type": "application/json",
-            "Origin"      : "https://claude.ai",
-            "Referer"     : "https://claude.ai/chats",
+            "Accept"               : "*/*",
+            "Accept-Language"      : "en-US,en;q=0.9",
+            "Accept-Encoding"      : "gzip, deflate, br",
+            "Content-Type"         : "application/json",
+            "Origin"               : "https://claude.ai",
+            "Referer"              : "https://claude.ai/chats",
+            "Sec-Ch-Ua"            : '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile"     : "?0",
+            "Sec-Ch-Ua-Platform"   : '"Windows"',
+            "Sec-Fetch-Dest"       : "empty",
+            "Sec-Fetch-Mode"       : "cors",
+            "Sec-Fetch-Site"       : "same-origin",
         })
 
     def set_key(self, key: str):
+        """Set session key with proper cookie configuration."""
         self.session_key = key
-        self.http.cookies.set("sessionKey", key, domain="claude.ai")
+        # Clear any existing sessionKey cookies
+        self.http.cookies.clear()
+        # Set with proper domain (note the leading dot)
+        self.http.cookies.set(
+            name   = "sessionKey",
+            value  = key,
+            domain = ".claude.ai",
+            path   = "/",
+            secure = True,
+        )
+        log.debug(f"Set session key cookie: {key[:20]}...")
 
 
 # Global store: { telegram_user_id: UserSession }
@@ -135,55 +155,61 @@ def validate_key(session_key: str) -> tuple[bool, str, str]:
     Validate a Claude session key.
     Returns (is_valid, org_id, org_name_or_error).
     """
-    # Create a proper session with full headers
     s = requests.Session()
     s.headers.update({
-        "User-Agent"  : (
+        "User-Agent"           : (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept"      : "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Content-Type": "application/json",
-        "Origin"      : "https://claude.ai",
-        "Referer"     : "https://claude.ai/chats",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
+        "Accept"               : "*/*",
+        "Accept-Language"      : "en-US,en;q=0.9",
+        "Content-Type"         : "application/json",
+        "Origin"               : "https://claude.ai",
+        "Referer"              : "https://claude.ai/chats",
+        "Sec-Ch-Ua"            : '"Chromium";v="124", "Google Chrome";v="124"',
+        "Sec-Ch-Ua-Mobile"     : "?0",
+        "Sec-Ch-Ua-Platform"   : '"Windows"',
+        "Sec-Fetch-Dest"       : "empty",
+        "Sec-Fetch-Mode"       : "cors",
+        "Sec-Fetch-Site"       : "same-origin",
     })
-    s.cookies.set("sessionKey", session_key, domain="claude.ai")
+    s.cookies.set(
+        name   = "sessionKey",
+        value  = session_key,
+        domain = ".claude.ai",
+        path   = "/",
+        secure = True,
+    )
     
     try:
         log.debug(f"Validating key: {session_key[:20]}...")
         resp = s.get(f"{BASE_URL}/organizations", timeout=15)
         
-        log.debug(f"Validation response: {resp.status_code}")
+        log.debug(f"Validation response status: {resp.status_code}")
         
         if resp.status_code == 403:
-            log.warning("Got 403 - key is expired or invalid")
+            log.warning("Validation got 403 - key expired or invalid")
             return (False, "", "Expired / Invalid")
         
         if resp.status_code == 401:
-            log.warning("Got 401 - unauthorized")
+            log.warning("Validation got 401 - unauthorized")
             return (False, "", "Unauthorized / Invalid Key")
             
         resp.raise_for_status()
         orgs = resp.json()
         
-        log.debug(f"Organizations response: {orgs}")
-        
         if not orgs:
             return (False, "", "No organizations found")
             
         org_name = orgs[0].get("name", "Unknown Organization")
-        org_id = orgs[0]["uuid"]
+        org_id   = orgs[0]["uuid"]
         
-        log.info(f"Key validated successfully for org: {org_name}")
+        log.info(f"Key validated ✓ Org: {org_name}")
         return (True, org_id, org_name)
         
     except requests.exceptions.Timeout:
-        log.error("Validation request timed out")
+        log.error("Validation timed out")
         return (False, "", "Request timed out")
     except requests.exceptions.ConnectionError:
         log.error("Connection error during validation")
@@ -197,14 +223,24 @@ def create_conversation(us: UserSession) -> str:
     """Create a new blank incognito conversation."""
     url     = f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations"
     payload = {"uuid": str(uuid.uuid4()), "name": "", "model": us.model}
-    resp    = us.http.post(url, json=payload, timeout=15)
-    resp.raise_for_status()
-    cid = resp.json()["uuid"]
-    us.conversation_id = cid
-    us.tracked_convs.append(cid)
-    us.history = []
-    log.info(f"Created conversation: {cid[:12]}...")
-    return cid
+    
+    try:
+        resp = us.http.post(url, json=payload, timeout=15)
+        log.debug(f"Create conversation status: {resp.status_code}")
+        resp.raise_for_status()
+        
+        cid = resp.json()["uuid"]
+        us.conversation_id = cid
+        us.tracked_convs.append(cid)
+        us.history = []
+        log.info(f"Created conversation: {cid[:12]}...")
+        return cid
+        
+    except requests.exceptions.HTTPError as e:
+        log.error(f"Failed to create conversation: {e}")
+        if e.response is not None:
+            log.error(f"Response body: {e.response.text[:500]}")
+        raise
 
 
 def delete_conversation(us: UserSession, conv_id: str) -> bool:
@@ -219,7 +255,8 @@ def delete_conversation(us: UserSession, conv_id: str) -> bool:
             us.tracked_convs.remove(conv_id)
         log.debug(f"Deleted conversation: {conv_id[:12]}...")
         return r.ok or r.status_code == 204
-    except Exception:
+    except Exception as e:
+        log.warning(f"Failed to delete conversation: {e}")
         return False
 
 
@@ -245,6 +282,7 @@ def send_message(us: UserSession, text: str, attachments: list = None) -> dict:
         f"{BASE_URL}/organizations/{us.organization_id}"
         f"/chat_conversations/{us.conversation_id}/completion"
     )
+    
     payload = {
         "prompt"     : text,
         "timezone"   : "UTC",
@@ -252,32 +290,63 @@ def send_message(us: UserSession, text: str, attachments: list = None) -> dict:
         "files"      : [],
     }
 
-    resp = us.http.post(url, json=payload, stream=True, timeout=120)
-    resp.raise_for_status()
+    try:
+        log.debug(f"Sending message to conversation {us.conversation_id[:12]}...")
+        log.debug(f"Cookies: {us.http.cookies}")
+        
+        resp = us.http.post(
+            url, 
+            json    = payload, 
+            stream  = True, 
+            timeout = 120
+        )
+        
+        log.debug(f"Completion response status: {resp.status_code}")
+        
+        if resp.status_code == 403:
+            log.error("Got 403 on completion endpoint")
+            log.error(f"Request headers: {dict(resp.request.headers)}")
+            log.error(f"Cookies sent: {resp.request._cookies}")
+            log.error(f"Response: {resp.text[:500]}")
+            raise requests.exceptions.HTTPError(
+                response=resp,
+                request=resp.request
+            )
+        
+        resp.raise_for_status()
 
-    full_text = ""
-    for line in resp.iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data: "):
-            continue
-        try:
-            event = json.loads(line[6:])
-            etype = event.get("type", "")
-            if etype == "completion":
-                full_text += event.get("completion", "")
-            elif etype == "error":
-                raise RuntimeError(
-                    event.get("error", {}).get("message", "Unknown error")
-                )
-        except json.JSONDecodeError:
-            continue
+        full_text = ""
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            try:
+                event = json.loads(line[6:])
+                etype = event.get("type", "")
+                if etype == "completion":
+                    full_text += event.get("completion", "")
+                elif etype == "error":
+                    err_msg = event.get("error", {}).get("message", "Unknown error")
+                    log.error(f"Claude API error: {err_msg}")
+                    raise RuntimeError(err_msg)
+            except json.JSONDecodeError:
+                continue
 
-    # Incognito: wipe immediately after reply
-    if us.incognito and AUTO_WIPE and us.conversation_id:
-        cid = us.conversation_id
-        us.conversation_id = ""
-        delete_conversation(us, cid)
+        log.info(f"Received {len(full_text)} chars from Claude")
 
-    return {"text": full_text, "files": extract_code_files(full_text)}
+        # Incognito: wipe immediately after reply
+        if us.incognito and AUTO_WIPE and us.conversation_id:
+            cid = us.conversation_id
+            us.conversation_id = ""
+            delete_conversation(us, cid)
+
+        return {"text": full_text, "files": extract_code_files(full_text)}
+        
+    except requests.exceptions.HTTPError as e:
+        log.error(f"HTTP error during completion: {e}")
+        raise
+    except Exception as e:
+        log.error(f"Error during send_message: {e}")
+        raise
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -967,7 +1036,7 @@ def handle_message(msg: Message):
     except requests.exceptions.HTTPError as e:
         code = e.response.status_code if e.response is not None else "?"
         msgs = {
-            403: "🔑 Session key expired. Please use /setkey to set a new one.",
+            403: "🔑 Session key expired or invalid. Use /setkey to update.",
             429: "⏳ Rate limited by Claude. Please wait and try again.",
             500: "💥 Claude server error. Try again in a moment.",
         }
