@@ -5,11 +5,13 @@
 Docker-ready — all config hardcoded below.
 ⚠️ UNOFFICIAL — Uses claude.ai web API. May break at any time.
 
-PROXY COMMANDS (add from bot — no code changes needed):
-  /setproxy http://user:pass@host:port   — set HTTP/HTTPS proxy
-  /setproxy socks5://user:pass@host:port — set SOCKS5 proxy
-  /delproxy                              — remove proxy
-  /proxystatus                           — check current proxy + IP
+PROXY COMMANDS (manage from bot — no code changes needed):
+  /addproxy http://user:pass@host:port   — add proxy to pool
+  /proxies                               — list all proxies + active one
+  /delproxy 2                            — remove proxy #2
+  /clearproxies                          — remove all proxies
+  /proxystatus                           — show active proxy + exit IP
+  /nextproxy                             — manually rotate to next proxy
 """
 
 import json
@@ -23,6 +25,7 @@ import logging
 import base64
 import signal
 import sys
+import urllib.parse
 from typing import Optional
 from dataclasses import dataclass, field
 from collections import defaultdict
@@ -55,13 +58,17 @@ MAX_CHUNK     = 4000
 # Logging level: DEBUG | INFO | WARNING | ERROR
 LOG_LEVEL     = "INFO"
 
-# ─── Default proxy for ALL users (optional) ────────────────────────
-# Leave as "" to disable. Users can override with /setproxy
-# Examples:
-#   "http://user:pass@host:port"
-#   "socks5://user:pass@host:port"
-#   "http://host:port"  (no auth)
-DEFAULT_PROXY = ""
+# ─── Default proxy pool for ALL users (optional) ───────────────────
+# Add proxy URLs here to pre-load them for every user.
+# Leave as empty list [] to start with no proxies.
+# Format: "http://user:pass@host:port" or "socks5://user:pass@host:port"
+DEFAULT_PROXIES: list[str] = []
+
+# ─── Auto-retry on 429 rate limit ──────────────────────────────────
+# How many times to retry before giving up
+RETRY_MAX     = 3
+# Seconds to wait between retries (doubles each attempt: 30 → 60 → 120)
+RETRY_DELAY   = 30
 
 # ═══════════════════════════════════════════════════════════════════
 #                    INTERNAL CONSTANTS (do not touch)
@@ -88,13 +95,140 @@ if not BOT_TOKEN or "YOUR_TELEGRAM_BOT_TOKEN_HERE" in BOT_TOKEN:
     sys.exit(1)
 
 log.info("━━━ Claude Incognito Telegram Bot ━━━")
-log.info(f"Model    : {DEFAULT_MODEL}")
-log.info(f"AutoWipe : {AUTO_WIPE}")
-log.info(f"Admins   : {ADMIN_IDS or 'Everyone'}")
-log.info(f"LogLevel : {LOG_LEVEL}")
-log.info(f"DefProxy : {DEFAULT_PROXY or 'None'}")
+log.info(f"Model      : {DEFAULT_MODEL}")
+log.info(f"AutoWipe   : {AUTO_WIPE}")
+log.info(f"Admins     : {ADMIN_IDS or 'Everyone'}")
+log.info(f"LogLevel   : {LOG_LEVEL}")
+log.info(f"RetryMax   : {RETRY_MAX}x  RetryDelay: {RETRY_DELAY}s")
+log.info(f"DefProxies : {len(DEFAULT_PROXIES)}")
 
 bot = TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+# ═══════════════════════════════════════════════════════════════════
+#                    PROXY POOL MANAGER
+# ═══════════════════════════════════════════════════════════════════
+
+class ProxyPool:
+    """
+    Manages a rotating pool of proxies.
+    - Automatically rotates to next on failure
+    - Tracks fail counts per proxy
+    - Removes permanently dead proxies after MAX_FAILS failures
+    """
+    MAX_FAILS = 3
+
+    def __init__(self, proxies: list[str] = None):
+        self._proxies   : list[str] = list(proxies or [])
+        self._index     : int       = 0
+        self._fails     : dict      = defaultdict(int)
+
+    # ── Read ──────────────────────────────────────────────────────
+
+    @property
+    def count(self) -> int:
+        return len(self._proxies)
+
+    @property
+    def active(self) -> str:
+        """Return the current active proxy URL, or '' if pool is empty."""
+        if not self._proxies:
+            return ""
+        self._index = self._index % len(self._proxies)
+        return self._proxies[self._index]
+
+    @property
+    def active_index(self) -> int:
+        """1-based index of active proxy (for display)."""
+        if not self._proxies:
+            return 0
+        return (self._index % len(self._proxies)) + 1
+
+    def all_proxies(self) -> list[tuple[int, str, int]]:
+        """Return [(1-based-index, url, fail_count), ...]"""
+        return [
+            (i + 1, url, self._fails.get(url, 0))
+            for i, url in enumerate(self._proxies)
+        ]
+
+    # ── Write ─────────────────────────────────────────────────────
+
+    def add(self, proxy_url: str) -> bool:
+        """Add a proxy. Returns False if already in pool."""
+        if proxy_url in self._proxies:
+            return False
+        self._proxies.append(proxy_url)
+        log.info(f"Proxy added to pool: {_mask_proxy(proxy_url)}")
+        return True
+
+    def remove(self, index_1based: int) -> Optional[str]:
+        """Remove proxy by 1-based index. Returns removed URL or None."""
+        idx = index_1based - 1
+        if idx < 0 or idx >= len(self._proxies):
+            return None
+        removed = self._proxies.pop(idx)
+        self._fails.pop(removed, None)
+        # Adjust current index
+        if self._proxies:
+            self._index = self._index % len(self._proxies)
+        else:
+            self._index = 0
+        log.info(f"Proxy removed: {_mask_proxy(removed)}")
+        return removed
+
+    def clear(self):
+        """Remove all proxies."""
+        self._proxies.clear()
+        self._fails.clear()
+        self._index = 0
+        log.info("Proxy pool cleared")
+
+    # ── Rotation ──────────────────────────────────────────────────
+
+    def rotate(self) -> str:
+        """Move to next proxy. Returns new active proxy URL."""
+        if len(self._proxies) <= 1:
+            return self.active
+        self._index = (self._index + 1) % len(self._proxies)
+        log.info(f"Rotated to proxy #{self.active_index}: {_mask_proxy(self.active)}")
+        return self.active
+
+    def mark_failed(self, proxy_url: str) -> bool:
+        """
+        Mark a proxy as failed. Auto-removes after MAX_FAILS.
+        Returns True if proxy was removed from pool.
+        """
+        if proxy_url not in self._proxies:
+            return False
+        self._fails[proxy_url] += 1
+        fails = self._fails[proxy_url]
+        log.warning(f"Proxy fail #{fails}/{self.MAX_FAILS}: {_mask_proxy(proxy_url)}")
+        if fails >= self.MAX_FAILS:
+            idx = self._proxies.index(proxy_url)
+            self._proxies.pop(idx)
+            self._fails.pop(proxy_url, None)
+            if self._proxies:
+                self._index = self._index % len(self._proxies)
+            else:
+                self._index = 0
+            log.warning(f"Proxy permanently removed (too many failures): {_mask_proxy(proxy_url)}")
+            return True
+        # Rotate away from the failed proxy
+        if len(self._proxies) > 1:
+            self.rotate()
+        return False
+
+    def mark_success(self, proxy_url: str):
+        """Reset fail count on success."""
+        if proxy_url in self._fails:
+            self._fails[proxy_url] = 0
+
+    def as_requests_dict(self) -> dict:
+        """Return proxies dict for requests, or {} if no proxies."""
+        url = self.active
+        if not url:
+            return {}
+        return {"http": url, "https": url}
+
 
 # ═══════════════════════════════════════════════════════════════════
 #                        DATA STRUCTURES
@@ -102,63 +236,53 @@ bot = TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 @dataclass
 class UserSession:
-    session_key     : str  = ""
-    organization_id : str  = ""
-    conversation_id : str  = ""
-    model           : str  = field(default_factory=lambda: DEFAULT_MODEL)
-    tracked_convs   : list = field(default_factory=list)
-    history         : list = field(default_factory=list)
+    session_key     : str        = ""
+    organization_id : str        = ""
+    conversation_id : str        = ""
+    model           : str        = field(default_factory=lambda: DEFAULT_MODEL)
+    tracked_convs   : list       = field(default_factory=list)
+    history         : list       = field(default_factory=list)
     http            : requests.Session = field(default_factory=requests.Session)
-    incognito       : bool = True
-    busy            : bool = False
-    proxy_url       : str  = field(default_factory=lambda: DEFAULT_PROXY)
+    incognito       : bool       = True
+    busy            : bool       = False
+    proxy_pool      : ProxyPool  = field(default_factory=lambda: ProxyPool(DEFAULT_PROXIES))
 
     def __post_init__(self):
-        """Initialize session with full browser-like headers."""
         self._apply_headers()
-        if self.proxy_url:
-            self._apply_proxy(self.proxy_url)
+        self._sync_proxy()
 
     def _apply_headers(self):
         self.http.headers.update({
-            "User-Agent"           : (
+            "User-Agent"            : (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            "Accept"               : "*/*",
-            "Accept-Language"      : "en-US,en;q=0.9",
-            "Accept-Encoding"      : "gzip, deflate, br",
-            "Content-Type"         : "application/json",
-            "Origin"               : "https://claude.ai",
-            "Referer"              : "https://claude.ai/chats",
-            "Sec-Ch-Ua"            : '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-            "Sec-Ch-Ua-Mobile"     : "?0",
-            "Sec-Ch-Ua-Platform"   : '"Windows"',
-            "Sec-Fetch-Dest"       : "empty",
-            "Sec-Fetch-Mode"       : "cors",
-            "Sec-Fetch-Site"       : "same-origin",
+            "Accept"                : "*/*",
+            "Accept-Language"       : "en-US,en;q=0.9",
+            "Accept-Encoding"       : "gzip, deflate, br",
+            "Content-Type"          : "application/json",
+            "Origin"                : "https://claude.ai",
+            "Referer"               : "https://claude.ai/chats",
+            "Sec-Ch-Ua"             : '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile"      : "?0",
+            "Sec-Ch-Ua-Platform"    : '"Windows"',
+            "Sec-Fetch-Dest"        : "empty",
+            "Sec-Fetch-Mode"        : "cors",
+            "Sec-Fetch-Site"        : "same-origin",
         })
 
-    def _apply_proxy(self, proxy_url: str):
-        """Apply proxy to the requests session."""
-        if proxy_url:
-            self.http.proxies = {
-                "http":  proxy_url,
-                "https": proxy_url,
-            }
-            log.debug(f"Proxy applied: {_mask_proxy(proxy_url)}")
-        else:
-            self.http.proxies = {}
-            log.debug("Proxy cleared")
+    def _sync_proxy(self):
+        """Sync requests.Session proxies from the pool's active proxy."""
+        self.http.proxies = self.proxy_pool.as_requests_dict()
 
-    def set_proxy(self, proxy_url: str):
-        """Set or clear proxy at runtime."""
-        self.proxy_url = proxy_url
-        self._apply_proxy(proxy_url)
+    def rotate_proxy(self) -> str:
+        """Rotate to next proxy and sync session."""
+        url = self.proxy_pool.rotate()
+        self._sync_proxy()
+        return url
 
     def set_key(self, key: str):
-        """Set session key with proper cookie configuration."""
         self.session_key = key
         self.http.cookies.clear()
         self.http.cookies.set(
@@ -168,7 +292,7 @@ class UserSession:
             path   = "/",
             secure = True,
         )
-        log.debug(f"Set session key cookie: {key[:20]}...")
+        log.debug(f"Session key set: {key[:20]}...")
 
 
 # Global store: { telegram_user_id: UserSession }
@@ -181,30 +305,35 @@ def get_session(uid: int) -> UserSession:
     return sessions[uid]
 
 
+# ═══════════════════════════════════════════════════════════════════
+#                      PROXY UTILITIES
+# ═══════════════════════════════════════════════════════════════════
+
 def _mask_proxy(proxy_url: str) -> str:
-    """Mask password in proxy URL for safe logging."""
+    """Mask password in proxy URL for safe logging/display."""
+    if not proxy_url:
+        return ""
     try:
-        import urllib.parse
         p = urllib.parse.urlparse(proxy_url)
         if p.password:
-            masked = proxy_url.replace(p.password, "****")
-            return masked
+            return proxy_url.replace(p.password, "****")
     except Exception:
         pass
-    return proxy_url[:30] + "..."
+    return proxy_url[:40] + ("..." if len(proxy_url) > 40 else "")
 
 
 def _parse_proxy_url(proxy_url: str) -> tuple[bool, str]:
     """
     Validate a proxy URL.
     Returns (is_valid, error_message).
-    Supports: http://, https://, socks5://, socks4://
     """
     try:
-        import urllib.parse
         p = urllib.parse.urlparse(proxy_url)
         if p.scheme not in ("http", "https", "socks5", "socks4"):
-            return False, f"Unsupported scheme '{p.scheme}'. Use http://, socks5://, or socks4://"
+            return False, (
+                f"Unsupported scheme '{p.scheme}'.\n"
+                f"Use: http://, https://, socks5://, or socks4://"
+            )
         if not p.hostname:
             return False, "Missing hostname in proxy URL"
         if not p.port:
@@ -214,153 +343,144 @@ def _parse_proxy_url(proxy_url: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _test_proxy(proxy_url: str) -> tuple[bool, str, str]:
+    """
+    Test proxy by fetching exit IP from api.ipify.org.
+    Returns (success, ip_address, error_message).
+    """
+    try:
+        s = requests.Session()
+        if proxy_url:
+            s.proxies = {"http": proxy_url, "https": proxy_url}
+        r = s.get("https://api.ipify.org?format=json", timeout=10)
+        r.raise_for_status()
+        ip = r.json().get("ip", "unknown")
+        return True, ip, ""
+    except requests.exceptions.ProxyError as e:
+        return False, "", f"Proxy unreachable: {e}"
+    except requests.exceptions.Timeout:
+        return False, "", "Timeout — proxy too slow or offline"
+    except Exception as e:
+        return False, "", str(e)
+
+
 # ═══════════════════════════════════════════════════════════════════
 #                     CLAUDE API FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════
 
 def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]:
     """
-    Validate a Claude session key by testing BOTH endpoints.
+    Validate a Claude session key.
     Returns (is_valid, org_id, org_name_or_error).
     """
     s = requests.Session()
     s.headers.update({
-        "User-Agent"       : (
+        "User-Agent"         : (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept"           : "*/*",
-        "Accept-Language"  : "en-US,en;q=0.9",
-        "Content-Type"     : "application/json",
-        "Origin"           : "https://claude.ai",
-        "Referer"          : "https://claude.ai/chats",
-        "Sec-Ch-Ua"        : '"Chromium";v="124", "Google Chrome";v="124"',
-        "Sec-Ch-Ua-Mobile" : "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest"   : "empty",
-        "Sec-Fetch-Mode"   : "cors",
-        "Sec-Fetch-Site"   : "same-origin",
+        "Accept"             : "*/*",
+        "Accept-Language"    : "en-US,en;q=0.9",
+        "Content-Type"       : "application/json",
+        "Origin"             : "https://claude.ai",
+        "Referer"            : "https://claude.ai/chats",
+        "Sec-Ch-Ua"          : '"Chromium";v="124", "Google Chrome";v="124"',
+        "Sec-Ch-Ua-Mobile"   : "?0",
+        "Sec-Ch-Ua-Platform" : '"Windows"',
+        "Sec-Fetch-Dest"     : "empty",
+        "Sec-Fetch-Mode"     : "cors",
+        "Sec-Fetch-Site"     : "same-origin",
     })
-    s.cookies.set(
-        name   = "sessionKey",
-        value  = session_key,
-        domain = ".claude.ai",
-        path   = "/",
-        secure = True,
-    )
+    s.cookies.set("sessionKey", session_key, domain=".claude.ai", path="/", secure=True)
     if proxy_url:
         s.proxies = {"http": proxy_url, "https": proxy_url}
-        log.debug(f"Validation using proxy: {_mask_proxy(proxy_url)}")
 
     try:
-        log.debug(f"Validating key (organizations): {session_key[:20]}...")
         resp = s.get(f"{BASE_URL}/organizations", timeout=15)
 
         if resp.status_code == 403:
-            log.warning("Validation got 403 on /organizations")
-            return (False, "", "Expired / Invalid — or IP blocked (try /setproxy)")
-
+            return False, "", "Expired/Invalid key — or VPS IP blocked (use /addproxy)"
         if resp.status_code == 401:
-            log.warning("Validation got 401 on /organizations")
-            return (False, "", "Unauthorized / Invalid Key")
+            return False, "", "Unauthorized / Invalid Key"
 
         resp.raise_for_status()
         orgs = resp.json()
 
         if not orgs:
-            return (False, "", "No organizations found")
+            return False, "", "No organizations found on this account"
 
-        org_name = orgs[0].get("name", "Unknown Organization")
+        org_name = orgs[0].get("name", "Unknown Org")
         org_id   = orgs[0]["uuid"]
 
-        log.debug(f"Testing conversation creation for org {org_id[:12]}...")
-        test_conv_url = f"{BASE_URL}/organizations/{org_id}/chat_conversations"
-        test_payload  = {
-            "uuid" : str(uuid.uuid4()),
-            "name" : "",
-            "model": DEFAULT_MODEL,
-        }
-
-        conv_resp = s.post(test_conv_url, json=test_payload, timeout=15)
+        # Also test chat_conversations endpoint
+        conv_resp = s.post(
+            f"{BASE_URL}/organizations/{org_id}/chat_conversations",
+            json    = {"uuid": str(uuid.uuid4()), "name": "", "model": DEFAULT_MODEL},
+            timeout = 15,
+        )
 
         if conv_resp.status_code == 403:
-            log.error("Key valid for /organizations but FAILS for /chat_conversations")
-            return (False, "", "Key works for validation but blocked for chat (403) — VPS IP may be blocked, use /setproxy")
+            return False, "", "Key valid for auth but blocked for chat (403) — IP may be blocked, add a proxy"
 
         if conv_resp.status_code not in (200, 201):
-            return (False, "", f"Cannot create conversations (HTTP {conv_resp.status_code})")
+            return False, "", f"Cannot create conversations (HTTP {conv_resp.status_code})"
 
-        test_conv_id = conv_resp.json().get("uuid")
-        if test_conv_id:
+        # Clean up test conversation
+        test_id = conv_resp.json().get("uuid")
+        if test_id:
             try:
-                s.delete(
-                    f"{BASE_URL}/organizations/{org_id}/chat_conversations/{test_conv_id}",
-                    timeout=5,
-                )
+                s.delete(f"{BASE_URL}/organizations/{org_id}/chat_conversations/{test_id}", timeout=5)
             except Exception:
                 pass
 
-        log.info(f"Key fully validated ✓ Org: {org_name}")
-        return (True, org_id, org_name)
+        log.info(f"Key validated ✓ Org: {org_name}")
+        return True, org_id, org_name
 
     except requests.exceptions.ProxyError as e:
-        log.error(f"Proxy error during validation: {e}")
-        return (False, "", f"Proxy error: {e}")
+        return False, "", f"Proxy error: {e}"
     except requests.exceptions.Timeout:
-        log.error("Validation timed out")
-        return (False, "", "Request timed out")
+        return False, "", "Request timed out"
     except requests.exceptions.ConnectionError as e:
-        log.error(f"Connection error during validation: {e}")
-        return (False, "", f"Connection error: {e}")
+        return False, "", f"Connection error: {e}"
     except Exception as e:
-        log.error(f"Validation error: {e}")
-        return (False, "", str(e))
+        return False, "", str(e)
 
 
 def create_conversation(us: UserSession) -> str:
-    """Create a new blank incognito conversation."""
-    url     = f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations"
-    payload = {"uuid": str(uuid.uuid4()), "name": "", "model": us.model}
-
-    try:
-        resp = us.http.post(url, json=payload, timeout=15)
-        log.debug(f"Create conversation status: {resp.status_code}")
-        resp.raise_for_status()
-
-        cid = resp.json()["uuid"]
-        us.conversation_id = cid
-        us.tracked_convs.append(cid)
-        us.history = []
-        log.info(f"Created conversation: {cid[:12]}...")
-        return cid
-
-    except requests.exceptions.HTTPError as e:
-        log.error(f"Failed to create conversation: {e}")
-        if e.response is not None:
-            log.error(f"Response body: {e.response.text[:500]}")
-        raise
+    """Create a new blank conversation."""
+    url = f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations"
+    resp = us.http.post(
+        url,
+        json    = {"uuid": str(uuid.uuid4()), "name": "", "model": us.model},
+        timeout = 15,
+    )
+    resp.raise_for_status()
+    cid = resp.json()["uuid"]
+    us.conversation_id = cid
+    us.tracked_convs.append(cid)
+    us.history = []
+    log.info(f"Created conversation: {cid[:12]}...")
+    return cid
 
 
 def delete_conversation(us: UserSession, conv_id: str) -> bool:
-    """Silently delete a conversation by ID."""
-    url = (
-        f"{BASE_URL}/organizations/{us.organization_id}"
-        f"/chat_conversations/{conv_id}"
-    )
+    """Silently delete a conversation."""
     try:
-        r = us.http.delete(url, timeout=10)
+        r = us.http.delete(
+            f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations/{conv_id}",
+            timeout=10,
+        )
         if conv_id in us.tracked_convs:
             us.tracked_convs.remove(conv_id)
-        log.debug(f"Deleted conversation: {conv_id[:12]}...")
         return r.ok or r.status_code == 204
     except Exception as e:
-        log.warning(f"Failed to delete conversation: {e}")
+        log.warning(f"Failed to delete conversation {conv_id[:12]}: {e}")
         return False
 
 
 def wipe_all(us: UserSession):
-    """Delete every tracked conversation for this user."""
+    """Delete every tracked conversation."""
     count = len(us.tracked_convs)
     for cid in list(us.tracked_convs):
         delete_conversation(us, cid)
@@ -369,9 +489,11 @@ def wipe_all(us: UserSession):
     log.info(f"Wiped {count} conversation(s)")
 
 
-def send_message(us: UserSession, text: str, attachments: list = None) -> dict:
+def send_message(us: UserSession, text: str, attachments: list = None, status_msg=None, chat_id: int = None) -> dict:
     """
-    Send a message to Claude and stream the full response.
+    Send a message to Claude with:
+    - Automatic proxy rotation on proxy failure
+    - Auto-retry with backoff on 429 rate limit
     Returns { 'text': str, 'files': list }
     """
     if not us.conversation_id:
@@ -381,7 +503,6 @@ def send_message(us: UserSession, text: str, attachments: list = None) -> dict:
         f"{BASE_URL}/organizations/{us.organization_id}"
         f"/chat_conversations/{us.conversation_id}/completion"
     )
-
     payload = {
         "prompt"     : text,
         "timezone"   : "UTC",
@@ -389,58 +510,148 @@ def send_message(us: UserSession, text: str, attachments: list = None) -> dict:
         "files"      : [],
     }
 
-    try:
-        log.debug(f"Sending message to conversation {us.conversation_id[:12]}...")
+    last_error    = None
+    retry_delay   = RETRY_DELAY
 
-        resp = us.http.post(
-            url,
-            json    = payload,
-            stream  = True,
-            timeout = 120,
-        )
+    for attempt in range(1, RETRY_MAX + 1):
+        current_proxy = us.proxy_pool.active
 
-        log.debug(f"Completion response status: {resp.status_code}")
+        try:
+            # Sync proxy before each attempt
+            us._sync_proxy()
 
-        if resp.status_code == 403:
-            log.error("Got 403 on completion endpoint")
-            raise requests.exceptions.HTTPError(response=resp, request=resp.request)
+            log.debug(
+                f"Attempt {attempt}/{RETRY_MAX} | "
+                f"Proxy: {_mask_proxy(current_proxy) or 'direct'} | "
+                f"Conv: {us.conversation_id[:12]}"
+            )
 
-        resp.raise_for_status()
+            resp = us.http.post(url, json=payload, stream=True, timeout=120)
 
-        full_text = ""
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line or not line.startswith("data: "):
+            # ── 429 Rate Limited ──────────────────────────────────
+            if resp.status_code == 429:
+                log.warning(f"429 rate limit on attempt {attempt}/{RETRY_MAX}")
+                if attempt < RETRY_MAX:
+                    wait = retry_delay * attempt
+                    log.info(f"Waiting {wait}s before retry…")
+                    if status_msg and chat_id:
+                        try:
+                            bot.edit_message_text(
+                                f"⏳ <i>Rate limited by Claude — retrying in {wait}s… (attempt {attempt}/{RETRY_MAX})</i>",
+                                chat_id    = chat_id,
+                                message_id = status_msg.message_id,
+                                parse_mode = "HTML",
+                            )
+                        except Exception:
+                            pass
+                    time.sleep(wait)
+                    # Rotate proxy on rate limit too — different proxy = different exit IP = separate rate limit bucket
+                    if us.proxy_pool.count > 1:
+                        new_proxy = us.rotate_proxy()
+                        log.info(f"Rotated proxy after 429: {_mask_proxy(new_proxy)}")
+                    continue
+                last_error = requests.exceptions.HTTPError(response=resp, request=resp.request)
+                break
+
+            # ── 403 Forbidden ─────────────────────────────────────
+            if resp.status_code == 403:
+                log.error(f"403 on attempt {attempt} with proxy {_mask_proxy(current_proxy)}")
+                if current_proxy:
+                    us.proxy_pool.mark_failed(current_proxy)
+                    if us.proxy_pool.count > 0:
+                        new_proxy = us.proxy_pool.active
+                        us._sync_proxy()
+                        log.info(f"Switched to proxy: {_mask_proxy(new_proxy)}")
+                        if status_msg and chat_id and attempt < RETRY_MAX:
+                            try:
+                                bot.edit_message_text(
+                                    f"⚠️ <i>Proxy blocked — switching to backup proxy… (attempt {attempt}/{RETRY_MAX})</i>",
+                                    chat_id    = chat_id,
+                                    message_id = status_msg.message_id,
+                                    parse_mode = "HTML",
+                                )
+                            except Exception:
+                                pass
+                        if attempt < RETRY_MAX:
+                            time.sleep(2)
+                            continue
+                last_error = requests.exceptions.HTTPError(response=resp, request=resp.request)
+                break
+
+            resp.raise_for_status()
+
+            # ── Stream response ───────────────────────────────────
+            full_text = ""
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                try:
+                    event = json.loads(line[6:])
+                    etype = event.get("type", "")
+                    if etype == "completion":
+                        full_text += event.get("completion", "")
+                    elif etype == "error":
+                        raise RuntimeError(event.get("error", {}).get("message", "Unknown error"))
+                except json.JSONDecodeError:
+                    continue
+
+            # ── Success ───────────────────────────────────────────
+            us.proxy_pool.mark_success(current_proxy)
+            log.info(f"Response received: {len(full_text)} chars (attempt {attempt})")
+
+            if us.incognito and AUTO_WIPE and us.conversation_id:
+                cid = us.conversation_id
+                us.conversation_id = ""
+                delete_conversation(us, cid)
+
+            return {"text": full_text, "files": extract_code_files(full_text)}
+
+        except requests.exceptions.ProxyError as e:
+            log.error(f"Proxy error on attempt {attempt}: {e}")
+            if current_proxy:
+                removed = us.proxy_pool.mark_failed(current_proxy)
+                if us.proxy_pool.count > 0:
+                    us._sync_proxy()
+                    if status_msg and chat_id and attempt < RETRY_MAX:
+                        try:
+                            bot.edit_message_text(
+                                f"⚠️ <i>Proxy error — switching to backup… (attempt {attempt}/{RETRY_MAX})</i>",
+                                chat_id    = chat_id,
+                                message_id = status_msg.message_id,
+                                parse_mode = "HTML",
+                            )
+                        except Exception:
+                            pass
+                    if attempt < RETRY_MAX:
+                        time.sleep(2)
+                        last_error = e
+                        continue
+            raise RuntimeError(
+                f"All proxies failed or no proxy set.\n"
+                f"Add more proxies with /addproxy\n"
+                f"Last error: {e}"
+            )
+
+        except requests.exceptions.Timeout as e:
+            log.warning(f"Timeout on attempt {attempt}")
+            last_error = e
+            if attempt < RETRY_MAX:
+                time.sleep(5)
                 continue
-            try:
-                event = json.loads(line[6:])
-                etype = event.get("type", "")
-                if etype == "completion":
-                    full_text += event.get("completion", "")
-                elif etype == "error":
-                    err_msg = event.get("error", {}).get("message", "Unknown error")
-                    log.error(f"Claude API error: {err_msg}")
-                    raise RuntimeError(err_msg)
-            except json.JSONDecodeError:
-                continue
+            raise RuntimeError("Request timed out after all retries")
 
-        log.info(f"Received {len(full_text)} chars from Claude")
+        except RuntimeError:
+            raise
 
-        if us.incognito and AUTO_WIPE and us.conversation_id:
-            cid = us.conversation_id
-            us.conversation_id = ""
-            delete_conversation(us, cid)
+        except Exception as e:
+            log.error(f"Unexpected error on attempt {attempt}: {e}")
+            last_error = e
+            break
 
-        return {"text": full_text, "files": extract_code_files(full_text)}
-
-    except requests.exceptions.ProxyError as e:
-        log.error(f"Proxy error during send_message: {e}")
-        raise RuntimeError(f"Proxy error: {e}. Use /setproxy to fix or /delproxy to remove.")
-    except requests.exceptions.HTTPError as e:
-        log.error(f"HTTP error during completion: {e}")
-        raise
-    except Exception as e:
-        log.error(f"Error during send_message: {e}")
-        raise
+    # All retries exhausted
+    if last_error:
+        raise last_error
+    raise RuntimeError("Failed after all retries")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -480,7 +691,7 @@ LANG_EXTENSIONS = {
 
 
 def extract_code_files(text: str) -> list:
-    """Extract code blocks from response and return as sendable files."""
+    """Extract large code blocks as sendable files."""
     pattern = r"```(\w+)?\n(.*?)```"
     matches = re.findall(pattern, text, re.DOTALL)
     files   = []
@@ -500,27 +711,20 @@ def extract_code_files(text: str) -> list:
 
 
 def guess_filename(code: str, lang: str) -> Optional[str]:
-    """Try to guess a meaningful filename from the code content."""
     ext = LANG_EXTENSIONS.get(lang, f".{lang}")
-
     if lang in ("python", "py"):
         m = re.search(r"^(?:class|def)\s+(\w+)", code, re.MULTILINE)
         if m:
             return f"{m.group(1).lower()}{ext}"
-
     if lang in ("javascript", "js", "typescript", "ts", "jsx", "tsx"):
-        m = re.search(
-            r"(?:export\s+default\s+(?:class|function)\s+|function\s+)(\w+)", code
-        )
+        m = re.search(r"(?:export\s+default\s+(?:class|function)\s+|function\s+)(\w+)", code)
         if m:
             return f"{m.group(1)}{ext}"
-
     if lang == "html":
         m = re.search(r"<title>(.*?)</title>", code, re.IGNORECASE)
         if m:
             safe = re.sub(r"[^\w\s-]", "", m.group(1)).strip().replace(" ", "_")[:30]
             return f"{safe or 'index'}.html"
-
     return None
 
 
@@ -529,7 +733,6 @@ def guess_filename(code: str, lang: str) -> Optional[str]:
 # ═══════════════════════════════════════════════════════════════════
 
 def md_to_tg_html(text: str) -> str:
-    """Convert Claude's Markdown output to Telegram-safe HTML."""
     chunks        = []
     pos           = 0
     code_block_re = re.compile(r"```(\w+)?\n(.*?)```", re.DOTALL)
@@ -549,7 +752,6 @@ def md_to_tg_html(text: str) -> str:
 
 
 def _convert_inline(text: str) -> str:
-    """Convert inline markdown elements to Telegram HTML."""
     text = html_lib.escape(text)
     text = re.sub(r"`([^`\n]+)`",               r"<code>\1</code>",     text)
     text = re.sub(r"\*\*(.+?)\*\*",             r"<b>\1</b>",           text, flags=re.DOTALL)
@@ -566,7 +768,6 @@ def _convert_inline(text: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 def smart_split(text: str, max_len: int = MAX_CHUNK) -> list[str]:
-    """Intelligently split a long message into Telegram-safe chunks."""
     if len(text) <= max_len:
         return [text]
 
@@ -577,9 +778,7 @@ def smart_split(text: str, max_len: int = MAX_CHUNK) -> list[str]:
         if len(remaining) <= max_len:
             chunks.append(remaining)
             break
-
         segment = remaining[:max_len]
-
         if "</pre>" in segment[max_len // 2:]:
             cut = segment.rfind("</pre>") + len("</pre>")
         elif "\n\n" in segment[max_len // 2:]:
@@ -590,7 +789,6 @@ def smart_split(text: str, max_len: int = MAX_CHUNK) -> list[str]:
             cut = segment.rfind(" ") + 1
         else:
             cut = max_len
-
         chunks.append(remaining[:cut])
         remaining = remaining[cut:]
 
@@ -598,14 +796,7 @@ def smart_split(text: str, max_len: int = MAX_CHUNK) -> list[str]:
 
 
 def _fix_unclosed_tags(chunk: str) -> str:
-    """Close any HTML tags that were split across chunks."""
-    for open_tag, close_tag in [
-        ("<pre>",  "</pre>"),
-        ("<code>", "</code>"),
-        ("<b>",    "</b>"),
-        ("<i>",    "</i>"),
-        ("<s>",    "</s>"),
-    ]:
+    for open_tag, close_tag in [("<pre>","</pre>"),("<code>","</code>"),("<b>","</b>"),("<i>","</i>"),("<s>","</s>")]:
         opens  = chunk.count(open_tag)
         closes = chunk.count(close_tag)
         if opens > closes:
@@ -616,10 +807,8 @@ def _fix_unclosed_tags(chunk: str) -> str:
 
 
 def send_chunked(chat_id: int, text: str, reply_to: int = None):
-    """Send a long message split into smart chunks."""
     chunks = smart_split(text)
     total  = len(chunks)
-
     for i, chunk in enumerate(chunks):
         if total > 1:
             chunk = f"<i>📄 Part {i+1}/{total}</i>\n\n" + chunk
@@ -633,10 +822,7 @@ def send_chunked(chat_id: int, text: str, reply_to: int = None):
         except apihelper.ApiTelegramException as e:
             if "can't parse entities" in str(e).lower():
                 plain = re.sub(r"<[^>]+>", "", chunk)
-                bot.send_message(
-                    chat_id, plain,
-                    reply_to_message_id = reply_to if i == 0 else None,
-                )
+                bot.send_message(chat_id, plain, reply_to_message_id=reply_to if i == 0 else None)
             else:
                 raise
         if i < total - 1:
@@ -644,7 +830,6 @@ def send_chunked(chat_id: int, text: str, reply_to: int = None):
 
 
 def send_files(chat_id: int, files: list, reply_to: int = None):
-    """Send extracted code blocks as downloadable Telegram files."""
     for f in files:
         try:
             bio      = io.BytesIO(f["content"].encode("utf-8"))
@@ -674,11 +859,9 @@ def auth_check(func):
         if not is_authorized(msg):
             bot.reply_to(
                 msg,
-                "🚫 <b>Access Denied</b>\n"
-                f"Your ID (<code>{msg.from_user.id}</code>) is not authorized.",
+                f"🚫 <b>Access Denied</b>\nYour ID: <code>{msg.from_user.id}</code>",
                 parse_mode="HTML",
             )
-            log.warning(f"Unauthorized access from user {msg.from_user.id}")
             return
         return func(msg, *args, **kwargs)
     return wrapper
@@ -694,46 +877,46 @@ def cmd_start(msg: Message):
     bot.reply_to(msg, """
 🕵️ <b>Claude Incognito Bot</b>
 
-Chat with Claude — all conversations <b>auto-deleted</b> (incognito).
-
 <b>━━━ Setup ━━━</b>
 /setkey <code>&lt;session_key&gt;</code> — Set your Claude session key
-/validate — Check if your current key still works
+/validate — Check if current key works
 /massvalidate — Bulk validate multiple keys
 
-<b>━━━ Proxy (fix VPS 403 errors) ━━━</b>
-/setproxy <code>&lt;proxy_url&gt;</code> — Set HTTP/SOCKS5 proxy
-/delproxy — Remove proxy
-/proxystatus — Show proxy info &amp; current IP
+<b>━━━ Proxy Pool (fix VPS 403 / rotate IPs) ━━━</b>
+/addproxy <code>&lt;url&gt;</code> — Add proxy to rotation pool
+/proxies — List all proxies + which is active
+/delproxy <code>&lt;number&gt;</code> — Remove proxy by number
+/clearproxies — Remove all proxies
+/proxystatus — Show active proxy + exit IP
+/nextproxy — Manually rotate to next proxy
 
 <b>━━━ Chat ━━━</b>
 Just send any message! Files and images supported.
 
 <b>━━━ Controls ━━━</b>
-/newchat   — Start fresh conversation
-/model     — Change Claude model
+/newchat — Start fresh conversation
+/model — Change Claude model
 /incognito — Toggle incognito mode
-/wipe      — Delete all tracked chats
-/status    — Session info
-/myid      — Show your Telegram user ID
+/wipe — Delete all tracked chats
+/status — Session info
+/myid — Show your Telegram user ID
+
+<b>━━━ Proxy Format ━━━</b>
+<code>http://user:pass@host:port</code>
+<code>socks5://user:pass@host:port</code>
+<code>http://host:port</code>  (no auth)
 
 <b>━━━ Get Session Key ━━━</b>
-1. Go to <a href="https://claude.ai">claude.ai</a>
-2. Login to your account
-3. Press F12 → Application → Cookies
-4. Find <code>sessionKey</code> cookie
-5. Copy the value (starts with sk-ant-sid01-)
-6. Send: /setkey &lt;paste_here&gt;
+1. Go to <a href="https://claude.ai">claude.ai</a> and login
+2. Press F12 → Application → Cookies
+3. Find and copy the <code>sessionKey</code> value
+4. Send: /setkey &lt;paste_here&gt;
 """.strip(), parse_mode="HTML", disable_web_page_preview=True)
 
 
 @bot.message_handler(commands=["myid"])
 def cmd_myid(msg: Message):
-    bot.reply_to(
-        msg,
-        f"🪪 Your Telegram User ID: <code>{msg.from_user.id}</code>",
-        parse_mode="HTML",
-    )
+    bot.reply_to(msg, f"🪪 Your Telegram ID: <code>{msg.from_user.id}</code>", parse_mode="HTML")
 
 
 # ── Set Key ────────────────────────────────────────────────────────
@@ -743,16 +926,10 @@ def cmd_myid(msg: Message):
 def cmd_setkey(msg: Message):
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        bot.reply_to(
-            msg,
-            "⚠️ <b>Usage:</b> /setkey <code>&lt;your_session_key&gt;</code>\n\n"
-            "Get your key from:\n"
-            "1. <a href='https://claude.ai'>claude.ai</a> → Login\n"
-            "2. F12 → Application → Cookies\n"
-            "3. Copy <code>sessionKey</code> value",
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+        bot.reply_to(msg,
+            "⚠️ <b>Usage:</b> /setkey <code>&lt;session_key&gt;</code>\n\n"
+            "Get from claude.ai → F12 → Application → Cookies → <code>sessionKey</code>",
+            parse_mode="HTML")
         return
 
     key = parts[1].strip()
@@ -761,13 +938,13 @@ def cmd_setkey(msg: Message):
 
     try:
         bot.delete_message(msg.chat.id, msg.message_id)
-        log.info(f"Deleted /setkey message from user {uid} for security")
-    except Exception as e:
-        log.warning(f"Could not delete /setkey message: {e}")
+    except Exception:
+        pass
 
-    thinking = bot.send_message(msg.chat.id, "🔄 <i>Validating your key...</i>", parse_mode="HTML")
+    thinking = bot.send_message(msg.chat.id, "🔄 <i>Validating key…</i>", parse_mode="HTML")
 
-    valid, org_id, info = validate_key(key, proxy_url=us.proxy_url)
+    # Use active proxy from pool for validation
+    valid, org_id, info = validate_key(key, proxy_url=us.proxy_pool.active)
 
     try:
         bot.delete_message(msg.chat.id, thinking.message_id)
@@ -776,79 +953,60 @@ def cmd_setkey(msg: Message):
 
     if not valid:
         proxy_hint = (
-            "\n\n💡 <b>Running on VPS?</b> Your IP may be blocked.\nUse /setproxy to add a residential proxy."
-            if not us.proxy_url else ""
+            "\n\n💡 No proxies in pool. Add one with /addproxy to bypass VPS IP blocks."
+            if us.proxy_pool.count == 0 else
+            f"\n\n🌐 Tried with proxy: <code>{html_lib.escape(_mask_proxy(us.proxy_pool.active))}</code>"
         )
-        bot.send_message(
-            msg.chat.id,
-            f"❌ <b>Invalid Session Key</b>\n\n"
-            f"Error: <code>{html_lib.escape(info)}</code>\n\n"
-            f"<b>Troubleshooting:</b>\n"
-            f"• Make sure you copied the FULL key\n"
-            f"• Key should start with <code>sk-ant-sid01-</code>\n"
-            f"• Try getting a fresh key from claude.ai\n"
-            f"• Make sure you're logged in to claude.ai"
-            f"{proxy_hint}",
-            parse_mode="HTML",
-        )
+        bot.send_message(msg.chat.id,
+            f"❌ <b>Invalid Session Key</b>\n\nError: <code>{html_lib.escape(info)}</code>{proxy_hint}",
+            parse_mode="HTML")
         return
 
     if us.organization_id and us.organization_id != org_id:
         wipe_all(us)
-        log.info(f"User {uid} switched organizations, wiped old conversations")
 
     us.set_key(key)
     us.organization_id = org_id
-    log.info(f"User {uid} successfully set key for org: {info}")
 
-    proxy_line = f"\n🌐 Proxy    : <code>{html_lib.escape(_mask_proxy(us.proxy_url))}</code>" if us.proxy_url else ""
-
-    bot.send_message(
-        msg.chat.id,
-        f"✅ <b>Session Key Configured!</b>\n\n"
-        f"🏢 Organization: <code>{html_lib.escape(info)}</code>\n"
-        f"🕵️ Incognito: <b>{'ON' if us.incognito else 'OFF'}</b>\n"
-        f"🤖 Model: <code>{us.model}</code>"
-        f"{proxy_line}\n\n"
-        f"<i>🔐 Your key message was deleted for security.</i>\n\n"
-        f"Start chatting now! Just send any message.",
-        parse_mode="HTML",
+    proxy_line = (
+        f"\n🌐 Proxies  : <b>{us.proxy_pool.count}</b> in pool (active: #{us.proxy_pool.active_index})"
+        if us.proxy_pool.count > 0 else
+        "\n🌐 Proxies  : <i>None — add with /addproxy</i>"
     )
 
+    bot.send_message(msg.chat.id,
+        f"✅ <b>Session Key Configured!</b>\n\n"
+        f"🏢 Org   : <code>{html_lib.escape(info)}</code>\n"
+        f"🕵️ Mode  : {'Incognito 🟢' if us.incognito else 'Normal 🔴'}\n"
+        f"🤖 Model : <code>{us.model}</code>"
+        f"{proxy_line}\n\n"
+        f"<i>🔐 Key message deleted for security.</i>",
+        parse_mode="HTML")
 
-# ── Proxy Management ───────────────────────────────────────────────
 
-@bot.message_handler(commands=["setproxy"])
+# ── Proxy Pool Commands ────────────────────────────────────────────
+
+@bot.message_handler(commands=["addproxy"])
 @auth_check
-def cmd_setproxy(msg: Message):
-    """
-    /setproxy http://user:pass@host:port
-    /setproxy socks5://user:pass@host:port
-    /setproxy http://host:port
-    """
+def cmd_addproxy(msg: Message):
+    """Add a proxy to the rotation pool."""
     parts = msg.text.split(maxsplit=1)
     uid   = msg.from_user.id
 
     if len(parts) < 2 or not parts[1].strip():
-        bot.reply_to(
-            msg,
-            "🌐 <b>Set Proxy</b>\n\n"
+        bot.reply_to(msg,
+            "🌐 <b>Add Proxy to Pool</b>\n\n"
             "<b>Usage:</b>\n"
-            "<code>/setproxy http://user:pass@host:port</code>\n"
-            "<code>/setproxy socks5://user:pass@host:port</code>\n"
-            "<code>/setproxy http://host:port</code>  (no auth)\n\n"
-            "<b>Examples:</b>\n"
-            "<code>/setproxy http://alice:secret@proxy.webshare.io:8080</code>\n"
-            "<code>/setproxy socks5://bob:pass@p.example.com:1080</code>\n\n"
-            "💡 Use a <b>residential proxy</b> to bypass VPS IP blocks on claude.ai.\n"
-            "   Recommended: webshare.io (has free tier)",
-            parse_mode="HTML",
-        )
+            "<code>/addproxy http://user:pass@host:port</code>\n"
+            "<code>/addproxy socks5://user:pass@host:port</code>\n\n"
+            "You can add multiple proxies — they rotate automatically on failure.\n"
+            "Use /proxies to see the full pool.",
+            parse_mode="HTML")
         return
 
     proxy_url = parts[1].strip()
 
-    # Delete the message immediately — it may contain credentials
+    # Delete message — may contain credentials
     try:
         bot.delete_message(msg.chat.id, msg.message_id)
     except Exception:
@@ -856,125 +1014,207 @@ def cmd_setproxy(msg: Message):
 
     valid, err = _parse_proxy_url(proxy_url)
     if not valid:
-        bot.send_message(
-            msg.chat.id,
-            f"❌ <b>Invalid proxy URL</b>\n\n"
-            f"Error: <code>{html_lib.escape(err)}</code>\n\n"
+        bot.send_message(msg.chat.id,
+            f"❌ <b>Invalid proxy URL</b>\n\nError: <code>{html_lib.escape(err)}</code>\n\n"
             f"Format: <code>http://user:pass@host:port</code>",
-            parse_mode="HTML",
-        )
+            parse_mode="HTML")
         return
 
-    thinking = bot.send_message(msg.chat.id, "🔄 <i>Testing proxy connection...</i>", parse_mode="HTML")
-
-    # Test the proxy by fetching ip info
-    test_ok, test_ip, test_err = _test_proxy(proxy_url)
+    thinking = bot.send_message(msg.chat.id, "🔄 <i>Testing proxy…</i>", parse_mode="HTML")
+    ok, ip, test_err = _test_proxy(proxy_url)
 
     try:
         bot.delete_message(msg.chat.id, thinking.message_id)
     except Exception:
         pass
 
-    if not test_ok:
-        bot.send_message(
-            msg.chat.id,
-            f"❌ <b>Proxy test failed</b>\n\n"
-            f"Error: <code>{html_lib.escape(test_err)}</code>\n\n"
-            f"• Check the proxy host/port/credentials\n"
-            f"• Make sure the proxy is online",
-            parse_mode="HTML",
-        )
+    if not ok:
+        bot.send_message(msg.chat.id,
+            f"❌ <b>Proxy test failed</b>\n\nError: <code>{html_lib.escape(test_err)}</code>",
+            parse_mode="HTML")
         return
 
     us = get_session(uid)
-    us.set_proxy(proxy_url)
-    log.info(f"User {uid} set proxy: {_mask_proxy(proxy_url)} → IP: {test_ip}")
+    added = us.proxy_pool.add(proxy_url)
+    us._sync_proxy()
 
-    bot.send_message(
-        msg.chat.id,
-        f"✅ <b>Proxy configured!</b>\n\n"
-        f"🌐 Proxy : <code>{html_lib.escape(_mask_proxy(proxy_url))}</code>\n"
-        f"📍 Exit IP: <code>{html_lib.escape(test_ip)}</code>\n\n"
-        f"<i>🔐 Your proxy message was deleted for security.</i>\n\n"
-        f"All Claude requests will now route through this proxy.\n"
-        f"Run /validate to confirm your session key works.",
-        parse_mode="HTML",
-    )
+    if not added:
+        bot.send_message(msg.chat.id,
+            f"⚠️ Proxy already in pool.\n📍 Exit IP: <code>{html_lib.escape(ip)}</code>",
+            parse_mode="HTML")
+        return
+
+    log.info(f"User {uid} added proxy #{us.proxy_pool.count}: {_mask_proxy(proxy_url)} → IP: {ip}")
+
+    bot.send_message(msg.chat.id,
+        f"✅ <b>Proxy #{us.proxy_pool.count} added!</b>\n\n"
+        f"🌐 Proxy  : <code>{html_lib.escape(_mask_proxy(proxy_url))}</code>\n"
+        f"📍 Exit IP: <code>{html_lib.escape(ip)}</code>\n"
+        f"🔄 Pool   : <b>{us.proxy_pool.count}</b> proxy(s) total\n\n"
+        f"<i>🔐 Proxy message deleted for security.</i>\n\n"
+        f"Use /proxies to see the full pool.",
+        parse_mode="HTML")
+
+
+@bot.message_handler(commands=["proxies"])
+@auth_check
+def cmd_proxies(msg: Message):
+    """List all proxies in the pool."""
+    us = get_session(msg.from_user.id)
+
+    if us.proxy_pool.count == 0:
+        bot.reply_to(msg,
+            "🌐 <b>Proxy Pool: Empty</b>\n\n"
+            "Add proxies with:\n<code>/addproxy http://user:pass@host:port</code>",
+            parse_mode="HTML")
+        return
+
+    lines = []
+    for idx, url, fails in us.proxy_pool.all_proxies():
+        active_marker = " ◀ <b>ACTIVE</b>" if idx == us.proxy_pool.active_index else ""
+        fail_indicator = f" ⚠️ {fails} fail(s)" if fails > 0 else ""
+        lines.append(
+            f"<b>#{idx}</b> <code>{html_lib.escape(_mask_proxy(url))}</code>"
+            f"{fail_indicator}{active_marker}"
+        )
+
+    bot.reply_to(msg,
+        f"🌐 <b>Proxy Pool</b> ({us.proxy_pool.count} total)\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(lines) + "\n\n"
+        f"<i>Proxies auto-rotate on failure.\n"
+        f"Remove one: /delproxy &lt;number&gt;</i>",
+        parse_mode="HTML")
 
 
 @bot.message_handler(commands=["delproxy"])
 @auth_check
 def cmd_delproxy(msg: Message):
-    """Remove the proxy from this user's session."""
+    """Remove a proxy by its number from the pool."""
+    parts = msg.text.split(maxsplit=1)
+    uid   = msg.from_user.id
+    us    = get_session(uid)
+
+    if us.proxy_pool.count == 0:
+        bot.reply_to(msg, "ℹ️ No proxies in pool.", parse_mode="HTML")
+        return
+
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        bot.reply_to(msg,
+            f"⚠️ <b>Usage:</b> /delproxy <code>&lt;number&gt;</code>\n\n"
+            f"Use /proxies to see proxy numbers.\n"
+            f"Current pool has <b>{us.proxy_pool.count}</b> proxy(s).",
+            parse_mode="HTML")
+        return
+
+    idx     = int(parts[1].strip())
+    removed = us.proxy_pool.remove(idx)
+    us._sync_proxy()
+
+    if removed is None:
+        bot.reply_to(msg,
+            f"❌ No proxy #{idx}. Pool has <b>{us.proxy_pool.count}</b> proxy(s).\nUse /proxies to see numbers.",
+            parse_mode="HTML")
+        return
+
+    log.info(f"User {uid} removed proxy #{idx}: {_mask_proxy(removed)}")
+
+    bot.reply_to(msg,
+        f"🗑 <b>Proxy #{idx} removed.</b>\n\n"
+        f"Removed: <code>{html_lib.escape(_mask_proxy(removed))}</code>\n"
+        f"Remaining: <b>{us.proxy_pool.count}</b> proxy(s) in pool",
+        parse_mode="HTML")
+
+
+@bot.message_handler(commands=["clearproxies"])
+@auth_check
+def cmd_clearproxies(msg: Message):
+    """Remove all proxies from the pool."""
     uid = msg.from_user.id
     us  = get_session(uid)
 
-    if not us.proxy_url:
-        bot.reply_to(msg, "ℹ️ No proxy configured.", parse_mode="HTML")
+    if us.proxy_pool.count == 0:
+        bot.reply_to(msg, "ℹ️ Proxy pool is already empty.", parse_mode="HTML")
         return
 
-    us.set_proxy("")
-    log.info(f"User {uid} removed proxy")
-    bot.reply_to(
-        msg,
-        "🗑 <b>Proxy removed.</b>\n\n"
-        "All requests will now go directly from this server.\n"
-        "If you're on a VPS and get 403 errors, re-add a proxy with /setproxy.",
-        parse_mode="HTML",
-    )
+    count = us.proxy_pool.count
+    us.proxy_pool.clear()
+    us._sync_proxy()
+    log.info(f"User {uid} cleared all {count} proxies")
+
+    bot.reply_to(msg,
+        f"🗑 <b>All {count} proxy(s) removed.</b>\n\n"
+        f"Requests will now go directly from this server.\n"
+        f"Add new proxies with /addproxy",
+        parse_mode="HTML")
+
+
+@bot.message_handler(commands=["nextproxy"])
+@auth_check
+def cmd_nextproxy(msg: Message):
+    """Manually rotate to the next proxy."""
+    uid = msg.from_user.id
+    us  = get_session(uid)
+
+    if us.proxy_pool.count == 0:
+        bot.reply_to(msg, "ℹ️ No proxies in pool. Add with /addproxy", parse_mode="HTML")
+        return
+
+    if us.proxy_pool.count == 1:
+        bot.reply_to(msg,
+            f"ℹ️ Only 1 proxy in pool — nothing to rotate to.\n"
+            f"Active: <code>{html_lib.escape(_mask_proxy(us.proxy_pool.active))}</code>",
+            parse_mode="HTML")
+        return
+
+    new_proxy = us.rotate_proxy()
+    log.info(f"User {uid} manually rotated to proxy #{us.proxy_pool.active_index}")
+
+    bot.send_chat_action(msg.chat.id, "typing")
+    ok, ip, err = _test_proxy(new_proxy)
+
+    bot.reply_to(msg,
+        f"🔄 <b>Rotated to proxy #{us.proxy_pool.active_index}</b>\n\n"
+        f"🌐 Proxy  : <code>{html_lib.escape(_mask_proxy(new_proxy))}</code>\n"
+        + (f"📍 Exit IP: <code>{html_lib.escape(ip)}</code>" if ok else f"⚠️ Test failed: <code>{html_lib.escape(err)}</code>"),
+        parse_mode="HTML")
 
 
 @bot.message_handler(commands=["proxystatus"])
 @auth_check
 def cmd_proxystatus(msg: Message):
-    """Show current proxy config and exit IP."""
+    """Show active proxy info and exit IP."""
     uid = msg.from_user.id
     us  = get_session(uid)
 
     bot.send_chat_action(msg.chat.id, "typing")
 
-    # Check current exit IP (through proxy if set, direct if not)
-    ok, ip, err = _test_proxy(us.proxy_url)
+    active = us.proxy_pool.active
+    ok, ip, err = _test_proxy(active)
 
-    if us.proxy_url:
-        proxy_line = f"🌐 Proxy   : <code>{html_lib.escape(_mask_proxy(us.proxy_url))}</code>\n"
+    if us.proxy_pool.count == 0:
+        pool_line = "🔄 Pool   : <i>Empty — add with /addproxy</i>"
     else:
-        proxy_line = "🌐 Proxy   : <i>None (direct connection)</i>\n"
+        pool_line = f"🔄 Pool   : <b>{us.proxy_pool.count}</b> proxy(s), active #{us.proxy_pool.active_index}"
 
-    if ok:
-        ip_line = f"📍 Exit IP : <code>{html_lib.escape(ip)}</code>\n"
-    else:
-        ip_line = f"📍 Exit IP : ❌ <code>{html_lib.escape(err)}</code>\n"
-
-    bot.reply_to(
-        msg,
-        f"📊 <b>Proxy Status</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"{proxy_line}"
-        f"{ip_line}",
-        parse_mode="HTML",
+    proxy_line = (
+        f"🌐 Active  : <code>{html_lib.escape(_mask_proxy(active))}</code>"
+        if active else
+        "🌐 Active  : <i>None (direct connection)</i>"
+    )
+    ip_line = (
+        f"📍 Exit IP : <code>{html_lib.escape(ip)}</code>"
+        if ok else
+        f"📍 Exit IP : ❌ <code>{html_lib.escape(err)}</code>"
     )
 
-
-def _test_proxy(proxy_url: str) -> tuple[bool, str, str]:
-    """
-    Test a proxy by fetching the exit IP from api.ipify.org.
-    Returns (success, ip_address, error_message).
-    """
-    try:
-        s = requests.Session()
-        if proxy_url:
-            s.proxies = {"http": proxy_url, "https": proxy_url}
-        r = s.get("https://api.ipify.org?format=json", timeout=10)
-        r.raise_for_status()
-        ip = r.json().get("ip", "unknown")
-        return True, ip, ""
-    except requests.exceptions.ProxyError as e:
-        return False, "", f"Proxy unreachable: {e}"
-    except requests.exceptions.Timeout:
-        return False, "", "Timeout — proxy too slow or offline"
-    except Exception as e:
-        return False, "", str(e)
+    bot.reply_to(msg,
+        f"📊 <b>Proxy Status</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"{proxy_line}\n"
+        f"{ip_line}\n"
+        f"{pool_line}",
+        parse_mode="HTML")
 
 
 # ── Validate ───────────────────────────────────────────────────────
@@ -984,39 +1224,30 @@ def _test_proxy(proxy_url: str) -> tuple[bool, str, str]:
 def cmd_validate(msg: Message):
     us = get_session(msg.from_user.id)
     if not us.session_key:
-        bot.reply_to(msg,
-            "⚠️ <b>No session key configured</b>\n\n"
-            "Use /setkey first to set your Claude session key.",
-            parse_mode="HTML")
+        bot.reply_to(msg, "⚠️ No session key. Use /setkey first.", parse_mode="HTML")
         return
 
     bot.send_chat_action(msg.chat.id, "typing")
-    valid, _, info = validate_key(us.session_key, proxy_url=us.proxy_url)
+    valid, _, info = validate_key(us.session_key, proxy_url=us.proxy_pool.active)
 
-    proxy_line = f"\n🌐 Proxy: <code>{html_lib.escape(_mask_proxy(us.proxy_url))}</code>" if us.proxy_url else ""
+    pool_line = (
+        f"\n🌐 Proxy #{us.proxy_pool.active_index}/{us.proxy_pool.count}: "
+        f"<code>{html_lib.escape(_mask_proxy(us.proxy_pool.active))}</code>"
+        if us.proxy_pool.count > 0 else ""
+    )
 
     if valid:
-        bot.reply_to(
-            msg,
-            f"✅ <b>Session Key is Valid!</b>\n\n"
-            f"🏢 Organization: <code>{html_lib.escape(info)}</code>"
-            f"{proxy_line}\n"
-            f"✨ Your key is working correctly.",
-            parse_mode="HTML",
-        )
+        bot.reply_to(msg,
+            f"✅ <b>Session Key Valid!</b>\n\n"
+            f"🏢 Org: <code>{html_lib.escape(info)}</code>{pool_line}",
+            parse_mode="HTML")
     else:
-        proxy_hint = (
-            "\n\n💡 <b>Tip:</b> If you're on a VPS, use /setproxy to add a residential proxy."
-            if not us.proxy_url else ""
-        )
-        bot.reply_to(
-            msg,
-            f"❌ <b>Session Key Expired or Invalid</b>\n\n"
+        bot.reply_to(msg,
+            f"❌ <b>Session Key Invalid</b>\n\n"
             f"Error: <code>{html_lib.escape(info)}</code>\n\n"
-            f"Use /setkey to configure a new key."
-            f"{proxy_hint}",
-            parse_mode="HTML",
-        )
+            f"Use /setkey to reconfigure."
+            + ("\n\n💡 Add proxies with /addproxy to bypass IP blocks." if us.proxy_pool.count == 0 else ""),
+            parse_mode="HTML")
 
 
 # ── Mass Validate ──────────────────────────────────────────────────
@@ -1026,16 +1257,11 @@ def cmd_validate(msg: Message):
 def cmd_massvalidate(msg: Message):
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        bot.reply_to(
-            msg,
+        bot.reply_to(msg,
             "📋 <b>Mass Key Validator</b>\n\n"
-            "Paste multiple session keys, one per line:\n\n"
-            "<code>/massvalidate\n"
-            "sk-ant-sid01-key1...\n"
-            "sk-ant-sid01-key2...\n"
-            "sk-ant-sid01-key3...</code>",
-            parse_mode="HTML",
-        )
+            "One key per line:\n\n"
+            "<code>/massvalidate\nsk-ant-sid01-key1...\nsk-ant-sid01-key2...</code>",
+            parse_mode="HTML")
         return
 
     keys  = [k.strip() for k in parts[1].strip().split("\n") if k.strip()]
@@ -1047,50 +1273,33 @@ def cmd_massvalidate(msg: Message):
     except Exception:
         pass
 
-    proxy_info = f" via proxy" if us.proxy_url else ""
-    status_msg = bot.send_message(
-        msg.chat.id,
-        f"🔄 Validating <b>{total}</b> key(s){proxy_info}…",
-        parse_mode="HTML",
-    )
+    status_msg = bot.send_message(msg.chat.id, f"🔄 Validating <b>{total}</b> key(s)…", parse_mode="HTML")
 
     results_valid   = []
     results_invalid = []
 
     for i, key in enumerate(keys):
-        valid, _, info = validate_key(key, proxy_url=us.proxy_url)
-
+        valid, _, info = validate_key(key, proxy_url=us.proxy_pool.active)
         if valid:
-            results_valid.append(
-                f"  ✅ <code>{html_lib.escape(key)}</code>\n"
-                f"     → {html_lib.escape(info)}"
-            )
+            results_valid.append(f"  ✅ <code>{html_lib.escape(key)}</code>\n     → {html_lib.escape(info)}")
         else:
-            results_invalid.append(
-                f"  ❌ <code>{html_lib.escape(key)}</code>\n"
-                f"     → {html_lib.escape(info)}"
-            )
-
+            results_invalid.append(f"  ❌ <code>{html_lib.escape(key)}</code>\n     → {html_lib.escape(info)}")
         if (i + 1) % 3 == 0 or i == total - 1:
             try:
                 bot.edit_message_text(
                     f"🔄 Validating… <b>{i+1}/{total}</b>",
-                    chat_id    = status_msg.chat.id,
-                    message_id = status_msg.message_id,
-                    parse_mode = "HTML",
-                )
+                    chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
             except Exception:
                 pass
 
     report = (
-        f"📊 <b>Mass Validation Report</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Mass Validation Report</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         f"Total: {total}  |  ✅ {len(results_valid)}  |  ❌ {len(results_invalid)}\n\n"
     )
     if results_valid:
-        report += "<b>✅ Valid Keys:</b>\n" + "\n\n".join(results_valid) + "\n\n"
+        report += "<b>✅ Valid:</b>\n" + "\n\n".join(results_valid) + "\n\n"
     if results_invalid:
-        report += "<b>❌ Invalid Keys:</b>\n" + "\n\n".join(results_invalid)
+        report += "<b>❌ Invalid:</b>\n" + "\n\n".join(results_invalid)
 
     try:
         bot.delete_message(status_msg.chat.id, status_msg.message_id)
@@ -1098,7 +1307,6 @@ def cmd_massvalidate(msg: Message):
         pass
 
     send_chunked(msg.chat.id, report.strip())
-    log.info(f"Mass validate completed: {len(results_valid)}/{total} valid")
 
 
 # ── New Chat ───────────────────────────────────────────────────────
@@ -1108,19 +1316,13 @@ def cmd_massvalidate(msg: Message):
 def cmd_newchat(msg: Message):
     us = get_session(msg.from_user.id)
     if not us.session_key or not us.organization_id:
-        bot.reply_to(msg, "⚠️ No session key configured. Use /setkey first.")
+        bot.reply_to(msg, "⚠️ No session key. Use /setkey first.")
         return
-
     if us.conversation_id:
         delete_conversation(us, us.conversation_id)
         us.conversation_id = ""
-
     us.history = []
-    bot.reply_to(
-        msg,
-        "🆕 <b>New conversation started!</b>\n<i>Previous chat was deleted.</i>",
-        parse_mode="HTML",
-    )
+    bot.reply_to(msg, "🆕 <b>New conversation started!</b>", parse_mode="HTML")
 
 
 # ── Model ──────────────────────────────────────────────────────────
@@ -1130,26 +1332,22 @@ def cmd_newchat(msg: Message):
 def cmd_model(msg: Message):
     parts = msg.text.split(maxsplit=1)
     us    = get_session(msg.from_user.id)
-
     if len(parts) < 2:
-        bot.reply_to(
-            msg,
-            f"🤖 Current model: <code>{us.model}</code>\n\n"
-            "<b>Available models:</b>\n"
-            "• <code>claude-sonnet-4-20250514</code> (latest, best)\n"
+        bot.reply_to(msg,
+            f"🤖 Current: <code>{us.model}</code>\n\n"
+            "<b>Available:</b>\n"
+            "• <code>claude-sonnet-4-20250514</code> (latest)\n"
             "• <code>claude-3-5-sonnet-20241022</code>\n"
             "• <code>claude-3-5-haiku-20241022</code> (fast)\n"
             "• <code>claude-3-opus-20240229</code>\n\n"
             "Usage: /model <code>&lt;model_name&gt;</code>",
-            parse_mode="HTML",
-        )
+            parse_mode="HTML")
         return
-
     us.model = parts[1].strip()
-    bot.reply_to(msg, f"✅ Model changed to: <code>{us.model}</code>", parse_mode="HTML")
+    bot.reply_to(msg, f"✅ Model: <code>{us.model}</code>", parse_mode="HTML")
 
 
-# ── Incognito Toggle ───────────────────────────────────────────────
+# ── Incognito ──────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["incognito"])
 @auth_check
@@ -1157,18 +1355,11 @@ def cmd_incognito(msg: Message):
     us           = get_session(msg.from_user.id)
     us.incognito = not us.incognito
     state        = "ON 🟢" if us.incognito else "OFF 🔴"
-    bot.reply_to(
-        msg,
-        f"🕵️ Incognito mode: <b>{state}</b>\n\n"
-        + (
-            "<i>✅ All conversations will be deleted after each reply.\n"
-            "No trace left in your claude.ai history.</i>"
-            if us.incognito else
-            "<i>⚠️ Conversations will remain on claude.ai.\n"
-            "They will only be deleted when you stop the bot.</i>"
-        ),
-        parse_mode="HTML",
-    )
+    bot.reply_to(msg,
+        f"🕵️ Incognito: <b>{state}</b>\n\n"
+        + ("✅ Conversations deleted after each reply." if us.incognito
+           else "⚠️ Conversations kept on claude.ai until /wipe."),
+        parse_mode="HTML")
 
 
 # ── Wipe ───────────────────────────────────────────────────────────
@@ -1179,10 +1370,10 @@ def cmd_wipe(msg: Message):
     us    = get_session(msg.from_user.id)
     count = len(us.tracked_convs)
     if count == 0:
-        bot.reply_to(msg, "ℹ️ No conversations to delete.", parse_mode="HTML")
+        bot.reply_to(msg, "ℹ️ Nothing to delete.")
         return
     wipe_all(us)
-    bot.reply_to(msg, f"🧹 Deleted <b>{count}</b> conversation(s) from claude.ai.", parse_mode="HTML")
+    bot.reply_to(msg, f"🧹 Deleted <b>{count}</b> conversation(s).", parse_mode="HTML")
 
 
 # ── Status ─────────────────────────────────────────────────────────
@@ -1191,33 +1382,33 @@ def cmd_wipe(msg: Message):
 @auth_check
 def cmd_status(msg: Message):
     us   = get_session(msg.from_user.id)
-    conv = (
-        f"<code>{us.conversation_id[:12]}…</code>"
-        if us.conversation_id else "None"
-    )
-    proxy_line = (
-        f"\n🌐 Proxy    : <code>{html_lib.escape(_mask_proxy(us.proxy_url))}</code>"
-        if us.proxy_url else
-        "\n🌐 Proxy    : <i>None</i>"
-    )
-    bot.reply_to(
-        msg,
+    conv = f"<code>{us.conversation_id[:12]}…</code>" if us.conversation_id else "None"
+
+    if us.proxy_pool.count == 0:
+        proxy_line = "\n🌐 Proxies  : <i>None — /addproxy to add</i>"
+    else:
+        proxy_line = (
+            f"\n🌐 Proxies  : <b>{us.proxy_pool.count}</b> in pool, "
+            f"active <b>#{us.proxy_pool.active_index}</b> → "
+            f"<code>{html_lib.escape(_mask_proxy(us.proxy_pool.active))}</code>"
+        )
+
+    bot.reply_to(msg,
         f"📊 <b>Session Status</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🔑 Key      : {'✅ Configured' if us.session_key else '❌ Not set'}\n"
+        f"🔑 Key      : {'✅ Set' if us.session_key else '❌ Not set'}\n"
         f"🕵️ Incognito : {'🟢 ON' if us.incognito else '🔴 OFF'}\n"
         f"🤖 Model    : <code>{us.model}</code>\n"
         f"💬 Current  : {conv}\n"
         f"📋 Tracked  : {len(us.tracked_convs)} conv(s)\n"
         f"💾 History  : {len(us.history)} msg(s)\n"
-        f"🐳 Docker   : ✅ Running"
+        f"🔁 Retry    : up to {RETRY_MAX}x ({RETRY_DELAY}s delay)"
         f"{proxy_line}",
-        parse_mode="HTML",
-    )
+        parse_mode="HTML")
 
 
 # ═══════════════════════════════════════════════════════════════════
-#               MAIN MESSAGE HANDLER (CHAT WITH CLAUDE)
+#               MAIN MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════
 
 @bot.message_handler(content_types=["text", "document", "photo"])
@@ -1227,28 +1418,18 @@ def handle_message(msg: Message):
     us  = get_session(uid)
 
     if not us.session_key or not us.organization_id:
-        bot.reply_to(
-            msg,
-            "⚠️ <b>No session key configured!</b>\n\n"
-            "Please set your Claude session key first:\n"
-            "/setkey <code>&lt;your_key&gt;</code>\n\n"
-            "See /help for detailed instructions.",
-            parse_mode="HTML",
-        )
+        bot.reply_to(msg,
+            "⚠️ <b>No session key!</b>\n\nUse /setkey <code>&lt;key&gt;</code> first.\nSee /help for instructions.",
+            parse_mode="HTML")
         return
 
     if us.busy:
-        bot.reply_to(
-            msg,
-            "⏳ <i>Please wait — still processing your previous message…</i>",
-            parse_mode="HTML",
-        )
+        bot.reply_to(msg, "⏳ <i>Still processing previous message…</i>", parse_mode="HTML")
         return
 
     user_text   = msg.text or msg.caption or ""
     attachments = []
 
-    # ── Document upload ─────────────────────────────────────────
     if msg.document:
         try:
             finfo = bot.get_file(msg.document.file_id)
@@ -1257,23 +1438,19 @@ def handle_message(msg: Message):
             try:
                 content    = fdata.decode("utf-8")
                 user_text += f"\n\n[File: {fname}]\n```\n{content}\n```"
-                log.info(f"User {uid} uploaded text file: {fname}")
             except UnicodeDecodeError:
                 b64        = base64.b64encode(fdata).decode()
                 user_text += f"\n\n[Binary file: {fname}, {len(fdata)} bytes]\n{b64[:2000]}…"
-                log.info(f"User {uid} uploaded binary file: {fname}")
         except Exception as e:
             bot.reply_to(msg, f"⚠️ Could not process file: {e}")
             return
 
-    # ── Photo upload ────────────────────────────────────────────
     if msg.photo:
         try:
             finfo      = bot.get_file(msg.photo[-1].file_id)
             fdata      = bot.download_file(finfo.file_path)
             b64        = base64.b64encode(fdata).decode()
-            user_text += f"\n\n[Image attached — base64 preview: {b64[:3000]}…]"
-            log.info(f"User {uid} uploaded image")
+            user_text += f"\n\n[Image attached — base64: {b64[:3000]}…]"
         except Exception as e:
             bot.reply_to(msg, f"⚠️ Could not process image: {e}")
 
@@ -1285,17 +1462,13 @@ def handle_message(msg: Message):
     bot.send_chat_action(msg.chat.id, "typing")
 
     try:
-        result    = send_message(us, user_text, attachments)
+        result    = send_message(us, user_text, attachments, status_msg=thinking, chat_id=msg.chat.id)
         resp_text = result["text"]
         files     = result["files"]
 
         if not resp_text.strip():
-            bot.edit_message_text(
-                "⚠️ <i>Claude sent an empty response.</i>",
-                chat_id    = thinking.chat.id,
-                message_id = thinking.message_id,
-                parse_mode = "HTML",
-            )
+            bot.edit_message_text("⚠️ <i>Empty response from Claude.</i>",
+                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
             return
 
         try:
@@ -1310,53 +1483,36 @@ def handle_message(msg: Message):
 
         us.history.append({"role": "user",      "text": user_text[:200]})
         us.history.append({"role": "assistant", "text": resp_text[:200]})
-        log.info(f"User {uid} → response: {len(resp_text)} chars, {len(files)} file(s)")
+        log.info(f"User {uid} → {len(resp_text)} chars, {len(files)} file(s)")
 
     except RuntimeError as e:
-        # Includes proxy errors surfaced from send_message
-        err_text = str(e)
         try:
             bot.edit_message_text(
-                f"❌ <b>Error:</b>\n<code>{html_lib.escape(err_text)}</code>",
-                chat_id    = thinking.chat.id,
-                message_id = thinking.message_id,
-                parse_mode = "HTML",
-            )
+                f"❌ <b>Error:</b>\n<code>{html_lib.escape(str(e))}</code>",
+                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
         except Exception:
-            bot.send_message(msg.chat.id, f"❌ {err_text}")
+            bot.send_message(msg.chat.id, f"❌ {e}")
 
     except requests.exceptions.HTTPError as e:
         code = e.response.status_code if e.response is not None else "?"
-        msgs = {
-            403: (
-                "🔑 Session key expired/invalid <b>or</b> VPS IP is blocked by Cloudflare.\n\n"
-                "• Try /validate to check your key\n"
-                "• If on a VPS: use /setproxy to add a residential proxy"
-            ),
-            429: "⏳ Rate limited by Claude. Please wait and try again.",
-            500: "💥 Claude server error. Try again in a moment.",
+        msgs_map = {
+            403: "🔑 Key expired or IP blocked.\n• /validate to check\n• /addproxy to add proxy",
+            429: f"⏳ Rate limited. Retried {RETRY_MAX}x and still blocked.\nWait a few minutes or add more proxies.",
+            500: "💥 Claude server error. Try again later.",
         }
-        err = msgs.get(code, f"HTTP {code} error occurred")
+        err = msgs_map.get(code, f"HTTP {code} error")
         try:
-            bot.edit_message_text(
-                f"❌ <b>Error {code}:</b>\n{err}",
-                chat_id    = thinking.chat.id,
-                message_id = thinking.message_id,
-                parse_mode = "HTML",
-            )
+            bot.edit_message_text(f"❌ <b>Error {code}:</b>\n{err}",
+                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
         except Exception:
             bot.send_message(msg.chat.id, f"❌ HTTP {code}: {err}", parse_mode="HTML")
-        log.error(f"HTTP {code} error for user {uid}")
 
     except Exception as e:
         log.exception(f"Unhandled error for user {uid}")
         try:
             bot.edit_message_text(
                 f"❌ <b>Unexpected error:</b>\n<code>{html_lib.escape(str(e))}</code>",
-                chat_id    = thinking.chat.id,
-                message_id = thinking.message_id,
-                parse_mode = "HTML",
-            )
+                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
         except Exception:
             pass
     finally:
@@ -1368,15 +1524,14 @@ def handle_message(msg: Message):
 # ═══════════════════════════════════════════════════════════════════
 
 def graceful_shutdown(sig, frame):
-    log.info("Shutdown signal received — cleaning up incognito sessions…")
+    log.info("Shutdown — cleaning up conversations…")
     wiped = 0
     for uid, us in sessions.items():
         if us.tracked_convs:
             count = len(us.tracked_convs)
             wipe_all(us)
             wiped += count
-            log.info(f"  Wiped {count} conv(s) for user {uid}")
-    log.info(f"✓ Cleanup complete. Wiped {wiped} total conversations. Goodbye.")
+    log.info(f"Wiped {wiped} conversation(s). Goodbye.")
     sys.exit(0)
 
 
@@ -1389,30 +1544,31 @@ signal.signal(signal.SIGTERM, graceful_shutdown)
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    log.info("Setting up bot commands menu…")
     try:
         bot.set_my_commands([
-            BotCommand("start",        "Welcome & help"),
-            BotCommand("setkey",       "Set your Claude session key"),
-            BotCommand("newchat",      "Start a fresh conversation"),
-            BotCommand("model",        "Change Claude model"),
-            BotCommand("validate",     "Check if your key still works"),
-            BotCommand("massvalidate", "Bulk validate multiple keys"),
-            BotCommand("incognito",    "Toggle incognito mode"),
-            BotCommand("wipe",         "Delete all tracked conversations"),
-            BotCommand("status",       "Show session info"),
-            BotCommand("myid",         "Get your Telegram user ID"),
-            BotCommand("setproxy",     "Set HTTP/SOCKS5 proxy (fix VPS 403)"),
-            BotCommand("delproxy",     "Remove proxy"),
-            BotCommand("proxystatus",  "Show proxy info & exit IP"),
-            BotCommand("help",         "Show help"),
+            BotCommand("start",         "Welcome & help"),
+            BotCommand("setkey",        "Set Claude session key"),
+            BotCommand("newchat",       "Start fresh conversation"),
+            BotCommand("model",         "Change Claude model"),
+            BotCommand("validate",      "Check if key still works"),
+            BotCommand("massvalidate",  "Bulk validate multiple keys"),
+            BotCommand("incognito",     "Toggle incognito mode"),
+            BotCommand("wipe",          "Delete all tracked conversations"),
+            BotCommand("status",        "Show session info"),
+            BotCommand("myid",          "Get your Telegram user ID"),
+            BotCommand("addproxy",      "Add proxy to rotation pool"),
+            BotCommand("proxies",       "List all proxies in pool"),
+            BotCommand("delproxy",      "Remove proxy by number"),
+            BotCommand("clearproxies",  "Remove all proxies"),
+            BotCommand("proxystatus",   "Show active proxy + exit IP"),
+            BotCommand("nextproxy",     "Manually rotate to next proxy"),
+            BotCommand("help",          "Show help"),
         ])
-        log.info("✓ Bot commands registered successfully")
+        log.info("✓ Commands registered")
     except Exception as e:
-        log.warning(f"Could not register bot commands: {e}")
+        log.warning(f"Could not register commands: {e}")
 
-    log.info("🚀 Bot is now polling for messages…")
-    log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    log.info("🚀 Polling…")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
 
