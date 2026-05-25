@@ -786,18 +786,20 @@ def cmd_massvalidate(msg: Message):
     results_invalid = []
 
     for i, key in enumerate(keys):
-        short = key[:20] + "…" + key[-8:] if len(key) > 30 else key
         valid, _, info = validate_key(key)
 
         if valid:
             results_valid.append(
-                f"  ✅ <code>{html_lib.escape(short)}</code>\n     → {html_lib.escape(info)}"
+                f"  ✅ <code>{html_lib.escape(key)}</code>\n"
+                f"     → {html_lib.escape(info)}"
             )
         else:
             results_invalid.append(
-                f"  ❌ <code>{html_lib.escape(short)}</code>\n     → {html_lib.escape(info)}"
+                f"  ❌ <code>{html_lib.escape(key)}</code>\n"
+                f"     → {html_lib.escape(info)}"
             )
 
+        # Update progress every 3 keys
         if (i + 1) % 3 == 0 or i == total - 1:
             try:
                 bot.edit_message_text(
@@ -809,15 +811,16 @@ def cmd_massvalidate(msg: Message):
             except Exception:
                 pass
 
+    # Build report
     report = (
         f"📊 <b>Mass Validation Report</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Total: {total}  |  ✅ {len(results_valid)}  |  ❌ {len(results_invalid)}\n\n"
     )
     if results_valid:
-        report += "<b>✅ Valid Keys:</b>\n" + "\n".join(results_valid) + "\n\n"
+        report += "<b>✅ Valid Keys:</b>\n" + "\n\n".join(results_valid) + "\n\n"
     if results_invalid:
-        report += "<b>❌ Invalid Keys:</b>\n" + "\n".join(results_invalid)
+        report += "<b>❌ Invalid Keys:</b>\n" + "\n\n".join(results_invalid)
 
     try:
         bot.delete_message(status_msg.chat.id, status_msg.message_id)
