@@ -152,7 +152,7 @@ def get_session(uid: int) -> UserSession:
 
 def validate_key(session_key: str) -> tuple[bool, str, str]:
     """
-    Validate a Claude session key.
+    Validate a Claude session key by testing BOTH endpoints.
     Returns (is_valid, org_id, org_name_or_error).
     """
     s = requests.Session()
@@ -183,17 +183,16 @@ def validate_key(session_key: str) -> tuple[bool, str, str]:
     )
     
     try:
-        log.debug(f"Validating key: {session_key[:20]}...")
+        # Step 1: Validate organizations endpoint
+        log.debug(f"Validating key (organizations): {session_key[:20]}...")
         resp = s.get(f"{BASE_URL}/organizations", timeout=15)
         
-        log.debug(f"Validation response status: {resp.status_code}")
-        
         if resp.status_code == 403:
-            log.warning("Validation got 403 - key expired or invalid")
+            log.warning("Validation got 403 on /organizations")
             return (False, "", "Expired / Invalid")
         
         if resp.status_code == 401:
-            log.warning("Validation got 401 - unauthorized")
+            log.warning("Validation got 401 on /organizations")
             return (False, "", "Unauthorized / Invalid Key")
             
         resp.raise_for_status()
@@ -205,7 +204,36 @@ def validate_key(session_key: str) -> tuple[bool, str, str]:
         org_name = orgs[0].get("name", "Unknown Organization")
         org_id   = orgs[0]["uuid"]
         
-        log.info(f"Key validated ✓ Org: {org_name}")
+        # Step 2: Test creating a conversation (this is what fails for you)
+        log.debug(f"Testing conversation creation for org {org_id[:12]}...")
+        test_conv_url = f"{BASE_URL}/organizations/{org_id}/chat_conversations"
+        test_payload  = {
+            "uuid": str(uuid.uuid4()),
+            "name": "",
+            "model": DEFAULT_MODEL,
+        }
+        
+        conv_resp = s.post(test_conv_url, json=test_payload, timeout=15)
+        
+        if conv_resp.status_code == 403:
+            log.error("Key valid for /organizations but FAILS for /chat_conversations")
+            log.error(f"Response: {conv_resp.text[:500]}")
+            return (False, "", "Key works for validation but not for chat (403)")
+        
+        if conv_resp.status_code != 201 and conv_resp.status_code != 200:
+            log.error(f"Conversation creation failed with {conv_resp.status_code}")
+            return (False, "", f"Cannot create conversations (HTTP {conv_resp.status_code})")
+        
+        # Success! Clean up test conversation
+        test_conv_id = conv_resp.json().get("uuid")
+        if test_conv_id:
+            try:
+                s.delete(f"{BASE_URL}/organizations/{org_id}/chat_conversations/{test_conv_id}", timeout=5)
+                log.debug(f"Cleaned up test conversation {test_conv_id[:12]}...")
+            except Exception:
+                pass  # Ignore cleanup errors
+        
+        log.info(f"Key fully validated ✓ Org: {org_name}")
         return (True, org_id, org_name)
         
     except requests.exceptions.Timeout:
