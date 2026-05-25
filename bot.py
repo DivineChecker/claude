@@ -911,6 +911,8 @@ Just send any message! Files and images supported.
 2. Press F12 → Application → Cookies
 3. Find and copy the <code>sessionKey</code> value
 4. Send: /setkey &lt;paste_here&gt;
+
+<b>Note:</b> You can add proxies BEFORE setting a session key!
 """.strip(), parse_mode="HTML", disable_web_page_preview=True)
 
 
@@ -1000,7 +1002,8 @@ def cmd_addproxy(msg: Message):
             "<code>/addproxy http://user:pass@host:port</code>\n"
             "<code>/addproxy socks5://user:pass@host:port</code>\n\n"
             "You can add multiple proxies — they rotate automatically on failure.\n"
-            "Use /proxies to see the full pool.",
+            "Use /proxies to see the full pool.\n\n"
+            "<b>💡 You can add proxies BEFORE setting a session key!</b>",
             parse_mode="HTML")
         return
 
@@ -1411,7 +1414,10 @@ def cmd_status(msg: Message):
 #               MAIN MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════
 
-@bot.message_handler(content_types=["text", "document", "photo"])
+@bot.message_handler(
+    content_types=["text", "document", "photo"], 
+    func=lambda msg: not (msg.text and msg.text.startswith('/'))
+)
 @auth_check
 def handle_message(msg: Message):
     uid = msg.from_user.id
