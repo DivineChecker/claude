@@ -449,139 +449,6 @@ def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]
         return False, "", str(e)
 
 
-def upload_image(us: UserSession, image_data: bytes, filename: str = "image.jpg") -> Optional[dict]:
-    """
-    Upload an image to Claude's file upload endpoint.
-    Uses the correct Claude.ai upload endpoint format.
-    Returns the attachment dict to include in the completion payload, or None on failure.
-    """
-    # Detect mime type from magic bytes
-    mime = "image/jpeg"
-    if image_data[:8] == b'\x89PNG\r\n\x1a\n':
-        mime = "image/png"
-        filename = re.sub(r'\.\w+$', '.png', filename)
-    elif image_data[:6] in (b'GIF87a', b'GIF89a'):
-        mime = "image/gif"
-        filename = re.sub(r'\.\w+$', '.gif', filename)
-    elif b'WEBP' in image_data[:12]:
-        mime = "image/webp"
-        filename = re.sub(r'\.\w+$', '.webp', filename)
-
-    # Store original Content-Type header
-    orig_ct = us.http.headers.get("Content-Type", "application/json")
-    
-    # Remove Content-Type to let requests set multipart boundary
-    if "Content-Type" in us.http.headers:
-        del us.http.headers["Content-Type"]
-
-    # Current Claude.ai upload endpoint
-    upload_url = f"{BASE_URL}/organizations/{us.organization_id}/files"
-    
-    try:
-        # Prepare multipart form data
-        files = {
-            'file': (filename, io.BytesIO(image_data), mime)
-        }
-        
-        # Some endpoints might need additional form data
-        data = {
-            'orgUuid': us.organization_id,
-        }
-        
-        log.debug(f"Uploading image to {upload_url} (size: {len(image_data)}B, type: {mime})")
-        
-        resp = us.http.post(
-            upload_url,
-            files=files,
-            data=data,
-            timeout=60,  # Increased timeout for larger files
-        )
-        
-        log.debug(f"Upload response: HTTP {resp.status_code}")
-        
-        # If primary endpoint fails, try alternative approaches
-        if resp.status_code == 404:
-            log.debug("Primary upload endpoint 404, trying alternative format...")
-            
-            # Try without orgUuid
-            resp = us.http.post(
-                upload_url,
-                files={'file': (filename, io.BytesIO(image_data), mime)},
-                timeout=60,
-            )
-            
-            if resp.status_code == 404:
-                # Try the conversation-specific upload endpoint
-                if us.conversation_id:
-                    conv_upload_url = f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations/{us.conversation_id}/files"
-                    log.debug(f"Trying conversation upload endpoint: {conv_upload_url}")
-                    resp = us.http.post(
-                        conv_upload_url,
-                        files={'file': (filename, io.BytesIO(image_data), mime)},
-                        timeout=60,
-                    )
-        
-        if resp.status_code not in (200, 201):
-            log.warning(f"Upload failed: HTTP {resp.status_code} - {resp.text[:200]}")
-            return None
-            
-        try:
-            result = resp.json()
-            log.debug(f"Upload response JSON: {result}")
-        except json.JSONDecodeError:
-            log.warning(f"Upload response not JSON: {resp.text[:200]}")
-            return None
-
-        # Extract file UUID from response - try multiple possible field names
-        file_uuid = None
-        possible_fields = [
-            'file_uuid', 'fileUuid', 'uuid', 'id', 'file_id', 'fileId',
-            ['file', 'uuid'], ['file', 'id'], ['data', 'uuid'], ['data', 'id']
-        ]
-        
-        for field in possible_fields:
-            if isinstance(field, list):
-                # Nested field like result['file']['uuid']
-                temp = result
-                try:
-                    for key in field:
-                        temp = temp[key]
-                    file_uuid = temp
-                    break
-                except (KeyError, TypeError):
-                    continue
-            else:
-                # Direct field like result['file_uuid']
-                file_uuid = result.get(field)
-                if file_uuid:
-                    break
-
-        if not file_uuid:
-            log.warning(f"No file UUID found in upload response: {result}")
-            return None
-
-        log.info(f"Image uploaded successfully! UUID: {file_uuid[:16]}... ({len(image_data)}B)")
-
-        # Return attachment object in the format Claude expects
-        return {
-            "file_name": filename,
-            "file_type": mime,
-            "file_size": len(image_data),
-            "extracted_content": "",
-            "file_uuid": str(file_uuid),
-        }
-
-    except requests.exceptions.RequestException as e:
-        log.warning(f"Upload request failed: {e}")
-        return None
-    except Exception as e:
-        log.warning(f"Unexpected upload error: {e}")
-        return None
-    finally:
-        # Restore original Content-Type header
-        us.http.headers["Content-Type"] = orig_ct
-
-
 def create_conversation(us: UserSession) -> str:
     """Create a new blank conversation."""
     url = f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations"
@@ -641,7 +508,7 @@ def send_message(us: UserSession, text: str, attachments: list = None, status_ms
     payload = {
         "prompt"     : text,
         "timezone"   : "UTC",
-        "attachments": attachments or [],  # list of attachment dicts with file_uuid
+        "attachments": attachments or [],
         "files"      : [],
     }
 
@@ -1027,6 +894,7 @@ def cmd_start(msg: Message):
 
 <b>━━━ Chat ━━━</b>
 Just send any message! Files and images supported.
+<i>Note: Images are embedded as base64 (5-10 images max per message)</i>
 
 <b>━━━ Controls ━━━</b>
 /newchat — Start fresh conversation
@@ -1588,8 +1456,8 @@ def _flush_media_group(uid: int, group_id: str):
 def _process_combined(uid: int, chat_id: int, first_msg: Message,
                       all_msgs: list[Message], user_text: str):
     """
-    Download all photos/documents from all_msgs, upload images to
-    Claude's file endpoint, combine everything into ONE request.
+    Download all photos/documents from all_msgs, embed images as base64,
+    combine everything into ONE request to Claude.
     """
     us = get_session(uid)
 
@@ -1605,24 +1473,34 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
             parse_mode="HTML")
         return
 
-    attachments = []   # proper file attachment dicts (images uploaded via API)
-    doc_parts   = []   # text file contents appended to prompt
+    image_parts = []   # base64-encoded images
+    doc_parts   = []   # text file contents
     failed_imgs = 0
 
     for msg in all_msgs:
-        # ── Photos — upload to Claude's file endpoint ────────────
+        # ── Photos — embed as base64 (reliable, no upload needed) ─
         if msg.photo:
             try:
-                finfo     = bot.get_file(msg.photo[-1].file_id)
-                fdata     = bot.download_file(finfo.file_path)
-                fname     = f"image_{len(attachments)+1}.jpg"
-                attachment = upload_image(us, fdata, fname)
-                if attachment:
-                    attachments.append(attachment)
-                    log.info(f"User {uid}: image uploaded OK → {attachment['file_uuid'][:16]}")
-                else:
-                    failed_imgs += 1
-                    log.warning(f"User {uid}: image upload failed, skipping")
+                finfo = bot.get_file(msg.photo[-1].file_id)
+                fdata = bot.download_file(finfo.file_path)
+                
+                # Detect mime type
+                mime = "image/jpeg"
+                if fdata[:8] == b'\x89PNG\r\n\x1a\n':
+                    mime = "image/png"
+                elif fdata[:6] in (b'GIF87a', b'GIF89a'):
+                    mime = "image/gif"
+                elif b'WEBP' in fdata[:12]:
+                    mime = "image/webp"
+                
+                # Convert to base64
+                b64 = base64.b64encode(fdata).decode('utf-8')
+                
+                # Claude expects images as markdown with data URLs
+                image_parts.append(f"![Image {len(image_parts)+1}](data:{mime};base64,{b64})")
+                
+                log.info(f"User {uid}: embedded image as base64 ({len(fdata)}B, {mime})")
+                
             except Exception as e:
                 failed_imgs += 1
                 log.warning(f"Could not process photo: {e}")
@@ -1637,11 +1515,19 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
                 # Try as image first if it's an image document
                 img_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
                 if any(fname.lower().endswith(ext) for ext in img_exts):
-                    attachment = upload_image(us, fdata, fname)
-                    if attachment:
-                        attachments.append(attachment)
-                        log.info(f"User {uid}: image-doc uploaded OK")
-                        continue
+                    # Detect mime type
+                    mime = "image/jpeg"
+                    if fdata[:8] == b'\x89PNG\r\n\x1a\n':
+                        mime = "image/png"
+                    elif fdata[:6] in (b'GIF87a', b'GIF89a'):
+                        mime = "image/gif"
+                    elif b'WEBP' in fdata[:12]:
+                        mime = "image/webp"
+                    
+                    b64 = base64.b64encode(fdata).decode('utf-8')
+                    image_parts.append(f"![{fname}](data:{mime};base64,{b64})")
+                    log.info(f"User {uid}: embedded image-doc as base64")
+                    continue
 
                 # Otherwise treat as text file
                 try:
@@ -1660,25 +1546,31 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
 
     # Build the combined prompt text
     combined = user_text or ""
+    
+    # Add all images as markdown
+    if image_parts:
+        combined += "\n\n" + "\n\n".join(image_parts)
+    
+    # Add document contents
     for doc in doc_parts:
         combined += f"\n\n{doc}"
 
-    # If no prompt text but we have images, add a default instruction
-    if not combined.strip() and attachments:
-        combined = "Please describe and analyze the attached image(s)."
+    # If no text but we have images, add a default instruction
+    if not user_text.strip() and image_parts:
+        combined = "Please describe and analyze the attached image(s).\n\n" + combined
 
-    if not combined.strip() and not attachments:
+    if not combined.strip():
         return
 
     # Status note
-    item_count = len(attachments) + len(doc_parts)
+    item_count = len(image_parts) + len(doc_parts)
     if item_count > 1:
         group_note = f"📎 <i>Grouped {item_count} item(s) into one request</i>\n"
     else:
         group_note = ""
 
     if failed_imgs > 0:
-        group_note += f"⚠️ <i>{failed_imgs} image(s) failed to upload</i>\n"
+        group_note += f"⚠️ <i>{failed_imgs} image(s) failed to process</i>\n"
 
     us.busy  = True
     thinking = bot.send_message(
@@ -1690,7 +1582,8 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
     bot.send_chat_action(chat_id, "typing")
 
     try:
-        result    = send_message(us, combined, attachments, status_msg=thinking, chat_id=chat_id)
+        # Send with empty attachments list since we're using base64 in prompt
+        result    = send_message(us, combined, [], status_msg=thinking, chat_id=chat_id)
         resp_text = result["text"]
         files     = result["files"]
 
@@ -1861,6 +1754,7 @@ def main():
         log.warning(f"Could not register commands: {e}")
 
     log.info("🚀 Polling…")
+    log.info("📸 Image mode: Base64 embedding (no upload API needed)")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
 
