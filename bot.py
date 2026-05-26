@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+remove the image handeling function completely to remove all errors also improve the bots response if possible and give whole code #!/usr/bin/env python3
 """
 🕵️ Claude Incognito Telegram Bot
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
