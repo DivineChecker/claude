@@ -493,7 +493,19 @@ def upload_image(us: UserSession, image_data: bytes, filename: str = "image.jpg"
             log.warning(f"Image upload failed HTTP {resp.status_code}: {resp.text[:200]}")
             return None
 
-        result = resp.json()
+        raw = resp.text.strip()
+        log.info(f"Image upload raw response: '{raw[:300]}'")
+
+        if not raw:
+            log.warning("Image upload: empty response body")
+            return None
+
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError as e:
+            log.warning(f"Image upload: non-JSON response ({e}): '{raw[:300]}'")
+            return None
+
         log.debug(f"Upload response: {result}")
 
         # Extract file identifier from response
