@@ -30,6 +30,8 @@ from typing import Optional
 from dataclasses import dataclass, field
 from collections import defaultdict
 
+import threading
+
 import requests
 from telebot import TeleBot, apihelper
 from telebot.types import Message, BotCommand
@@ -911,8 +913,6 @@ Just send any message! Files and images supported.
 2. Press F12 → Application → Cookies
 3. Find and copy the <code>sessionKey</code> value
 4. Send: /setkey &lt;paste_here&gt;
-
-<b>Note:</b> You can add proxies BEFORE setting a session key!
 """.strip(), parse_mode="HTML", disable_web_page_preview=True)
 
 
@@ -1002,8 +1002,7 @@ def cmd_addproxy(msg: Message):
             "<code>/addproxy http://user:pass@host:port</code>\n"
             "<code>/addproxy socks5://user:pass@host:port</code>\n\n"
             "You can add multiple proxies — they rotate automatically on failure.\n"
-            "Use /proxies to see the full pool.\n\n"
-            "<b>💡 You can add proxies BEFORE setting a session key!</b>",
+            "Use /proxies to see the full pool.",
             parse_mode="HTML")
         return
 
@@ -1411,13 +1410,200 @@ def cmd_status(msg: Message):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#               MEDIA GROUP BUFFER
+#   Telegram sends each photo in a group as a SEPARATE update,
+#   all sharing the same media_group_id. We buffer them for
+#   MEDIA_GROUP_WAIT seconds then fire ONE combined request.
+# ═══════════════════════════════════════════════════════════════════
+
+# Seconds to wait for more photos to arrive in the same group
+MEDIA_GROUP_WAIT = 1.5
+
+# { (user_id, media_group_id): { "msgs": [...], "timer": Timer, "chat_id": int } }
+_media_buffers: dict = {}
+_media_lock           = threading.Lock()
+
+
+def _flush_media_group(uid: int, group_id: str):
+    """
+    Called after MEDIA_GROUP_WAIT seconds. Collects all buffered
+    messages for this group and fires a single Claude request.
+    """
+    with _media_lock:
+        key  = (uid, group_id)
+        data = _media_buffers.pop(key, None)
+
+    if not data:
+        return
+
+    msgs    : list[Message] = data["msgs"]
+    chat_id : int           = data["chat_id"]
+
+    # Use the first message as the "anchor" for reply
+    first_msg = msgs[0]
+
+    # Collect caption from whichever message has one
+    caption = ""
+    for m in msgs:
+        if m.caption:
+            caption = m.caption.strip()
+            break
+
+    _process_combined(uid, chat_id, first_msg, msgs, caption)
+
+
+def _process_combined(uid: int, chat_id: int, first_msg: Message,
+                      all_msgs: list[Message], user_text: str):
+    """
+    Download all photos/documents from all_msgs, combine with
+    user_text, then send as ONE request to Claude.
+    """
+    us = get_session(uid)
+
+    if not us.session_key or not us.organization_id:
+        bot.send_message(chat_id,
+            "⚠️ <b>No session key!</b>\n\nUse /setkey first.",
+            parse_mode="HTML")
+        return
+
+    if us.busy:
+        bot.send_message(chat_id,
+            "⏳ <i>Still processing previous message…</i>",
+            parse_mode="HTML")
+        return
+
+    image_parts  = []
+    doc_parts    = []
+
+    for msg in all_msgs:
+        # ── Photos ──────────────────────────────────────────────
+        if msg.photo:
+            try:
+                finfo = bot.get_file(msg.photo[-1].file_id)
+                fdata = bot.download_file(finfo.file_path)
+                b64   = base64.b64encode(fdata).decode()
+                image_parts.append(b64)
+                log.info(f"User {uid}: buffered image {len(fdata)} bytes")
+            except Exception as e:
+                log.warning(f"Could not download photo: {e}")
+
+        # ── Documents ───────────────────────────────────────────
+        if msg.document:
+            try:
+                finfo = bot.get_file(msg.document.file_id)
+                fdata = bot.download_file(finfo.file_path)
+                fname = msg.document.file_name or "file"
+                try:
+                    content   = fdata.decode("utf-8")
+                    doc_parts.append(f"[File: {fname}]\n```\n{content}\n```")
+                except UnicodeDecodeError:
+                    b64 = base64.b64encode(fdata).decode()
+                    doc_parts.append(f"[Binary file: {fname}, {len(fdata)} bytes]\n{b64[:2000]}…")
+                log.info(f"User {uid}: buffered document {fname}")
+            except Exception as e:
+                log.warning(f"Could not download document: {e}")
+
+        # ── Plain text (no media) ────────────────────────────────
+        if msg.text and not msg.photo and not msg.document:
+            if msg.text.strip() and msg.text.strip() != user_text:
+                user_text += "\n" + msg.text.strip()
+
+    # Build the combined prompt
+    combined = user_text or ""
+
+    # Append all images as base64 blocks
+    for i, b64 in enumerate(image_parts):
+        label = f"Image {i+1}" if len(image_parts) > 1 else "Image"
+        combined += f"\n\n[{label} attached — base64: {b64[:3000]}…]"
+
+    # Append all documents
+    for doc in doc_parts:
+        combined += f"\n\n{doc}"
+
+    if not combined.strip():
+        return
+
+    # Show how many items were grouped
+    item_count = len(image_parts) + len(doc_parts)
+    if item_count > 1:
+        group_note = f"📎 <i>Grouped {item_count} item(s) into one request</i>\n"
+    elif item_count == 1 and user_text:
+        group_note = ""
+    else:
+        group_note = ""
+
+    us.busy  = True
+    thinking = bot.send_message(
+        chat_id,
+        group_note + "🧠 <i>Claude is thinking…</i>",
+        parse_mode          = "HTML",
+        reply_to_message_id = first_msg.message_id,
+    )
+    bot.send_chat_action(chat_id, "typing")
+
+    try:
+        result    = send_message(us, combined, [], status_msg=thinking, chat_id=chat_id)
+        resp_text = result["text"]
+        files     = result["files"]
+
+        if not resp_text.strip():
+            bot.edit_message_text("⚠️ <i>Empty response from Claude.</i>",
+                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
+            return
+
+        try:
+            bot.delete_message(thinking.chat.id, thinking.message_id)
+        except Exception:
+            pass
+
+        send_chunked(chat_id, md_to_tg_html(resp_text), reply_to=first_msg.message_id)
+
+        if files:
+            send_files(chat_id, files, reply_to=first_msg.message_id)
+
+        us.history.append({"role": "user",      "text": combined[:200]})
+        us.history.append({"role": "assistant", "text": resp_text[:200]})
+        log.info(f"User {uid} → {len(resp_text)} chars, {len(files)} file(s), {item_count} media item(s)")
+
+    except RuntimeError as e:
+        try:
+            bot.edit_message_text(
+                f"❌ <b>Error:</b>\n<code>{html_lib.escape(str(e))}</code>",
+                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
+        except Exception:
+            bot.send_message(chat_id, f"❌ {e}")
+
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        msgs_map = {
+            403: "🔑 Key expired or IP blocked.\n• /validate to check\n• /addproxy to add proxy",
+            429: f"⏳ Rate limited. Retried {RETRY_MAX}x — still blocked.\nWait a few minutes or add more proxies with /addproxy.",
+            500: "💥 Claude server error. Try again later.",
+        }
+        err = msgs_map.get(code, f"HTTP {code} error")
+        try:
+            bot.edit_message_text(f"❌ <b>Error {code}:</b>\n{err}",
+                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
+        except Exception:
+            bot.send_message(chat_id, f"❌ HTTP {code}: {err}", parse_mode="HTML")
+
+    except Exception as e:
+        log.exception(f"Unhandled error for user {uid}")
+        try:
+            bot.edit_message_text(
+                f"❌ <b>Unexpected error:</b>\n<code>{html_lib.escape(str(e))}</code>",
+                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
+        except Exception:
+            pass
+    finally:
+        us.busy = False
+
+
+# ═══════════════════════════════════════════════════════════════════
 #               MAIN MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════
 
-@bot.message_handler(
-    content_types=["text", "document", "photo"], 
-    func=lambda msg: not (msg.text and msg.text.startswith('/'))
-)
+@bot.message_handler(content_types=["text", "document", "photo"])
 @auth_check
 def handle_message(msg: Message):
     uid = msg.from_user.id
@@ -1433,96 +1619,45 @@ def handle_message(msg: Message):
         bot.reply_to(msg, "⏳ <i>Still processing previous message…</i>", parse_mode="HTML")
         return
 
-    user_text   = msg.text or msg.caption or ""
-    attachments = []
+    # ── Media group: buffer and wait for all photos to arrive ────
+    if msg.media_group_id:
+        key = (uid, msg.media_group_id)
+        with _media_lock:
+            if key not in _media_buffers:
+                # First message of this group — start a timer
+                timer = threading.Timer(
+                    MEDIA_GROUP_WAIT,
+                    _flush_media_group,
+                    args=(uid, msg.media_group_id),
+                )
+                _media_buffers[key] = {
+                    "msgs"   : [msg],
+                    "timer"  : timer,
+                    "chat_id": msg.chat.id,
+                }
+                timer.start()
+                log.debug(f"Media group {msg.media_group_id}: started buffer (user {uid})")
+            else:
+                # Additional photo in the same group — add and reset timer
+                _media_buffers[key]["msgs"].append(msg)
+                # Cancel old timer and start a fresh one so we always
+                # wait MEDIA_GROUP_WAIT after the LAST photo arrives
+                _media_buffers[key]["timer"].cancel()
+                timer = threading.Timer(
+                    MEDIA_GROUP_WAIT,
+                    _flush_media_group,
+                    args=(uid, msg.media_group_id),
+                )
+                _media_buffers[key]["timer"] = timer
+                timer.start()
+                log.debug(
+                    f"Media group {msg.media_group_id}: "
+                    f"{len(_media_buffers[key]['msgs'])} items buffered"
+                )
+        return  # Don't process yet — wait for the timer
 
-    if msg.document:
-        try:
-            finfo = bot.get_file(msg.document.file_id)
-            fdata = bot.download_file(finfo.file_path)
-            fname = msg.document.file_name or "file"
-            try:
-                content    = fdata.decode("utf-8")
-                user_text += f"\n\n[File: {fname}]\n```\n{content}\n```"
-            except UnicodeDecodeError:
-                b64        = base64.b64encode(fdata).decode()
-                user_text += f"\n\n[Binary file: {fname}, {len(fdata)} bytes]\n{b64[:2000]}…"
-        except Exception as e:
-            bot.reply_to(msg, f"⚠️ Could not process file: {e}")
-            return
-
-    if msg.photo:
-        try:
-            finfo      = bot.get_file(msg.photo[-1].file_id)
-            fdata      = bot.download_file(finfo.file_path)
-            b64        = base64.b64encode(fdata).decode()
-            user_text += f"\n\n[Image attached — base64: {b64[:3000]}…]"
-        except Exception as e:
-            bot.reply_to(msg, f"⚠️ Could not process image: {e}")
-
-    if not user_text.strip():
-        return
-
-    us.busy  = True
-    thinking = bot.reply_to(msg, "🧠 <i>Claude is thinking…</i>", parse_mode="HTML")
-    bot.send_chat_action(msg.chat.id, "typing")
-
-    try:
-        result    = send_message(us, user_text, attachments, status_msg=thinking, chat_id=msg.chat.id)
-        resp_text = result["text"]
-        files     = result["files"]
-
-        if not resp_text.strip():
-            bot.edit_message_text("⚠️ <i>Empty response from Claude.</i>",
-                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
-            return
-
-        try:
-            bot.delete_message(thinking.chat.id, thinking.message_id)
-        except Exception:
-            pass
-
-        send_chunked(msg.chat.id, md_to_tg_html(resp_text), reply_to=msg.message_id)
-
-        if files:
-            send_files(msg.chat.id, files, reply_to=msg.message_id)
-
-        us.history.append({"role": "user",      "text": user_text[:200]})
-        us.history.append({"role": "assistant", "text": resp_text[:200]})
-        log.info(f"User {uid} → {len(resp_text)} chars, {len(files)} file(s)")
-
-    except RuntimeError as e:
-        try:
-            bot.edit_message_text(
-                f"❌ <b>Error:</b>\n<code>{html_lib.escape(str(e))}</code>",
-                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
-        except Exception:
-            bot.send_message(msg.chat.id, f"❌ {e}")
-
-    except requests.exceptions.HTTPError as e:
-        code = e.response.status_code if e.response is not None else "?"
-        msgs_map = {
-            403: "🔑 Key expired or IP blocked.\n• /validate to check\n• /addproxy to add proxy",
-            429: f"⏳ Rate limited. Retried {RETRY_MAX}x and still blocked.\nWait a few minutes or add more proxies.",
-            500: "💥 Claude server error. Try again later.",
-        }
-        err = msgs_map.get(code, f"HTTP {code} error")
-        try:
-            bot.edit_message_text(f"❌ <b>Error {code}:</b>\n{err}",
-                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
-        except Exception:
-            bot.send_message(msg.chat.id, f"❌ HTTP {code}: {err}", parse_mode="HTML")
-
-    except Exception as e:
-        log.exception(f"Unhandled error for user {uid}")
-        try:
-            bot.edit_message_text(
-                f"❌ <b>Unexpected error:</b>\n<code>{html_lib.escape(str(e))}</code>",
-                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
-        except Exception:
-            pass
-    finally:
-        us.busy = False
+    # ── Single message (text, single photo, or document) ─────────
+    _process_combined(uid, msg.chat.id, msg, [msg], msg.text or msg.caption or "")
 
 
 # ═══════════════════════════════════════════════════════════════════
