@@ -1603,7 +1603,10 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
 #               MAIN MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════
 
-@bot.message_handler(content_types=["text", "document", "photo"])
+@bot.message_handler(
+    content_types=["text", "document", "photo"], 
+    func=lambda msg: not (msg.text and msg.text.startswith('/'))
+)
 @auth_check
 def handle_message(msg: Message):
     uid = msg.from_user.id
