@@ -449,6 +449,79 @@ def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]
         return False, "", str(e)
 
 
+def upload_image(us: UserSession, image_data: bytes, filename: str = "image.jpg") -> Optional[dict]:
+    """
+    Upload an image to Claude's file upload endpoint.
+    Returns the attachment dict to include in the completion payload, or None on failure.
+
+    Claude.ai accepts images via multipart upload to:
+      POST /api/convert_document
+    which returns a file_uuid used in the attachments list.
+    """
+    try:
+        # Detect mime type from first bytes
+        mime = "image/jpeg"
+        if image_data[:4] == b'\x89PNG':
+            mime     = "image/png"
+            filename = filename.replace(".jpg", ".png")
+        elif image_data[:4] == b'GIF8':
+            mime     = "image/gif"
+            filename = filename.replace(".jpg", ".gif")
+        elif image_data[:2] == b'BM':
+            mime     = "image/bmp"
+            filename = filename.replace(".jpg", ".bmp")
+        elif image_data[:4] in (b'RIFF',) or b'WEBP' in image_data[:12]:
+            mime     = "image/webp"
+            filename = filename.replace(".jpg", ".webp")
+
+        url = f"{BASE_URL}/convert_document"
+
+        # Build multipart form — same as what the browser sends
+        files_payload = {
+            "file": (filename, io.BytesIO(image_data), mime),
+        }
+        data_payload = {
+            "orgUuid": us.organization_id,
+        }
+
+        # Temporarily remove Content-Type so requests sets multipart boundary correctly
+        orig_ct = us.http.headers.pop("Content-Type", "application/json")
+
+        resp = us.http.post(
+            url,
+            files   = files_payload,
+            data    = data_payload,
+            timeout = 30,
+        )
+
+        us.http.headers["Content-Type"] = orig_ct  # restore
+
+        if resp.status_code not in (200, 201):
+            log.warning(f"Image upload failed HTTP {resp.status_code}: {resp.text[:200]}")
+            return None
+
+        result    = resp.json()
+        file_uuid = result.get("file_uuid") or result.get("id") or result.get("uuid")
+
+        if not file_uuid:
+            log.warning(f"Image upload: no file_uuid in response: {result}")
+            return None
+
+        log.info(f"Uploaded image → file_uuid: {file_uuid[:16]}... ({len(image_data)} bytes)")
+
+        return {
+            "file_name"    : filename,
+            "file_type"    : mime,
+            "file_size"    : len(image_data),
+            "extracted_content": "",
+            "file_uuid"    : file_uuid,
+        }
+
+    except Exception as e:
+        log.warning(f"Image upload error: {e}")
+        return None
+
+
 def create_conversation(us: UserSession) -> str:
     """Create a new blank conversation."""
     url = f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations"
@@ -508,7 +581,7 @@ def send_message(us: UserSession, text: str, attachments: list = None, status_ms
     payload = {
         "prompt"     : text,
         "timezone"   : "UTC",
-        "attachments": attachments or [],
+        "attachments": attachments or [],  # list of attachment dicts with file_uuid
         "files"      : [],
     }
 
@@ -1455,8 +1528,8 @@ def _flush_media_group(uid: int, group_id: str):
 def _process_combined(uid: int, chat_id: int, first_msg: Message,
                       all_msgs: list[Message], user_text: str):
     """
-    Download all photos/documents from all_msgs, combine with
-    user_text, then send as ONE request to Claude.
+    Download all photos/documents from all_msgs, upload images to
+    Claude's file endpoint, combine everything into ONE request.
     """
     us = get_session(uid)
 
@@ -1472,65 +1545,80 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
             parse_mode="HTML")
         return
 
-    image_parts  = []
-    doc_parts    = []
+    attachments = []   # proper file attachment dicts (images uploaded via API)
+    doc_parts   = []   # text file contents appended to prompt
+    failed_imgs = 0
 
     for msg in all_msgs:
-        # ── Photos ──────────────────────────────────────────────
+        # ── Photos — upload to Claude's file endpoint ────────────
         if msg.photo:
             try:
-                finfo = bot.get_file(msg.photo[-1].file_id)
-                fdata = bot.download_file(finfo.file_path)
-                b64   = base64.b64encode(fdata).decode()
-                image_parts.append(b64)
-                log.info(f"User {uid}: buffered image {len(fdata)} bytes")
+                finfo     = bot.get_file(msg.photo[-1].file_id)
+                fdata     = bot.download_file(finfo.file_path)
+                fname     = f"image_{len(attachments)+1}.jpg"
+                attachment = upload_image(us, fdata, fname)
+                if attachment:
+                    attachments.append(attachment)
+                    log.info(f"User {uid}: image uploaded OK → {attachment['file_uuid'][:16]}")
+                else:
+                    failed_imgs += 1
+                    log.warning(f"User {uid}: image upload failed, skipping")
             except Exception as e:
-                log.warning(f"Could not download photo: {e}")
+                failed_imgs += 1
+                log.warning(f"Could not process photo: {e}")
 
-        # ── Documents ───────────────────────────────────────────
+        # ── Documents — read as text and append to prompt ────────
         if msg.document:
             try:
                 finfo = bot.get_file(msg.document.file_id)
                 fdata = bot.download_file(finfo.file_path)
                 fname = msg.document.file_name or "file"
+
+                # Try as image first if it's an image document
+                img_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+                if any(fname.lower().endswith(ext) for ext in img_exts):
+                    attachment = upload_image(us, fdata, fname)
+                    if attachment:
+                        attachments.append(attachment)
+                        log.info(f"User {uid}: image-doc uploaded OK")
+                        continue
+
+                # Otherwise treat as text file
                 try:
                     content   = fdata.decode("utf-8")
                     doc_parts.append(f"[File: {fname}]\n```\n{content}\n```")
                 except UnicodeDecodeError:
-                    b64 = base64.b64encode(fdata).decode()
-                    doc_parts.append(f"[Binary file: {fname}, {len(fdata)} bytes]\n{b64[:2000]}…")
+                    doc_parts.append(f"[Binary file: {fname}, {len(fdata)} bytes — cannot display]")
                 log.info(f"User {uid}: buffered document {fname}")
             except Exception as e:
-                log.warning(f"Could not download document: {e}")
+                log.warning(f"Could not process document: {e}")
 
-        # ── Plain text (no media) ────────────────────────────────
+        # ── Plain text messages in a group ───────────────────────
         if msg.text and not msg.photo and not msg.document:
             if msg.text.strip() and msg.text.strip() != user_text:
                 user_text += "\n" + msg.text.strip()
 
-    # Build the combined prompt
+    # Build the combined prompt text
     combined = user_text or ""
-
-    # Append all images as base64 blocks
-    for i, b64 in enumerate(image_parts):
-        label = f"Image {i+1}" if len(image_parts) > 1 else "Image"
-        combined += f"\n\n[{label} attached — base64: {b64[:3000]}…]"
-
-    # Append all documents
     for doc in doc_parts:
         combined += f"\n\n{doc}"
 
-    if not combined.strip():
+    # If no prompt text but we have images, add a default instruction
+    if not combined.strip() and attachments:
+        combined = "Please describe and analyze the attached image(s)."
+
+    if not combined.strip() and not attachments:
         return
 
-    # Show how many items were grouped
-    item_count = len(image_parts) + len(doc_parts)
+    # Status note
+    item_count = len(attachments) + len(doc_parts)
     if item_count > 1:
         group_note = f"📎 <i>Grouped {item_count} item(s) into one request</i>\n"
-    elif item_count == 1 and user_text:
-        group_note = ""
     else:
         group_note = ""
+
+    if failed_imgs > 0:
+        group_note += f"⚠️ <i>{failed_imgs} image(s) failed to upload</i>\n"
 
     us.busy  = True
     thinking = bot.send_message(
@@ -1542,7 +1630,7 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
     bot.send_chat_action(chat_id, "typing")
 
     try:
-        result    = send_message(us, combined, [], status_msg=thinking, chat_id=chat_id)
+        result    = send_message(us, combined, attachments, status_msg=thinking, chat_id=chat_id)
         resp_text = result["text"]
         files     = result["files"]
 
@@ -1603,10 +1691,7 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
 #               MAIN MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════
 
-@bot.message_handler(
-    content_types=["text", "document", "photo"], 
-    func=lambda msg: not (msg.text and msg.text.startswith('/'))
-)
+@bot.message_handler(content_types=["text", "document", "photo"])
 @auth_check
 def handle_message(msg: Message):
     uid = msg.from_user.id
