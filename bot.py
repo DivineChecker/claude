@@ -452,74 +452,134 @@ def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]
 def upload_image(us: UserSession, image_data: bytes, filename: str = "image.jpg") -> Optional[dict]:
     """
     Upload an image to Claude's file upload endpoint.
+    Uses the correct Claude.ai upload endpoint format.
     Returns the attachment dict to include in the completion payload, or None on failure.
-
-    Claude.ai accepts images via multipart upload to:
-      POST /api/convert_document
-    which returns a file_uuid used in the attachments list.
     """
+    # Detect mime type from magic bytes
+    mime = "image/jpeg"
+    if image_data[:8] == b'\x89PNG\r\n\x1a\n':
+        mime = "image/png"
+        filename = re.sub(r'\.\w+$', '.png', filename)
+    elif image_data[:6] in (b'GIF87a', b'GIF89a'):
+        mime = "image/gif"
+        filename = re.sub(r'\.\w+$', '.gif', filename)
+    elif b'WEBP' in image_data[:12]:
+        mime = "image/webp"
+        filename = re.sub(r'\.\w+$', '.webp', filename)
+
+    # Store original Content-Type header
+    orig_ct = us.http.headers.get("Content-Type", "application/json")
+    
+    # Remove Content-Type to let requests set multipart boundary
+    if "Content-Type" in us.http.headers:
+        del us.http.headers["Content-Type"]
+
+    # Current Claude.ai upload endpoint
+    upload_url = f"{BASE_URL}/organizations/{us.organization_id}/files"
+    
     try:
-        # Detect mime type from first bytes
-        mime = "image/jpeg"
-        if image_data[:4] == b'\x89PNG':
-            mime     = "image/png"
-            filename = filename.replace(".jpg", ".png")
-        elif image_data[:4] == b'GIF8':
-            mime     = "image/gif"
-            filename = filename.replace(".jpg", ".gif")
-        elif image_data[:2] == b'BM':
-            mime     = "image/bmp"
-            filename = filename.replace(".jpg", ".bmp")
-        elif image_data[:4] in (b'RIFF',) or b'WEBP' in image_data[:12]:
-            mime     = "image/webp"
-            filename = filename.replace(".jpg", ".webp")
-
-        url = f"{BASE_URL}/convert_document"
-
-        # Build multipart form — same as what the browser sends
-        files_payload = {
-            "file": (filename, io.BytesIO(image_data), mime),
+        # Prepare multipart form data
+        files = {
+            'file': (filename, io.BytesIO(image_data), mime)
         }
-        data_payload = {
-            "orgUuid": us.organization_id,
+        
+        # Some endpoints might need additional form data
+        data = {
+            'orgUuid': us.organization_id,
         }
-
-        # Temporarily remove Content-Type so requests sets multipart boundary correctly
-        orig_ct = us.http.headers.pop("Content-Type", "application/json")
-
+        
+        log.debug(f"Uploading image to {upload_url} (size: {len(image_data)}B, type: {mime})")
+        
         resp = us.http.post(
-            url,
-            files   = files_payload,
-            data    = data_payload,
-            timeout = 30,
+            upload_url,
+            files=files,
+            data=data,
+            timeout=60,  # Increased timeout for larger files
         )
-
-        us.http.headers["Content-Type"] = orig_ct  # restore
-
+        
+        log.debug(f"Upload response: HTTP {resp.status_code}")
+        
+        # If primary endpoint fails, try alternative approaches
+        if resp.status_code == 404:
+            log.debug("Primary upload endpoint 404, trying alternative format...")
+            
+            # Try without orgUuid
+            resp = us.http.post(
+                upload_url,
+                files={'file': (filename, io.BytesIO(image_data), mime)},
+                timeout=60,
+            )
+            
+            if resp.status_code == 404:
+                # Try the conversation-specific upload endpoint
+                if us.conversation_id:
+                    conv_upload_url = f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations/{us.conversation_id}/files"
+                    log.debug(f"Trying conversation upload endpoint: {conv_upload_url}")
+                    resp = us.http.post(
+                        conv_upload_url,
+                        files={'file': (filename, io.BytesIO(image_data), mime)},
+                        timeout=60,
+                    )
+        
         if resp.status_code not in (200, 201):
-            log.warning(f"Image upload failed HTTP {resp.status_code}: {resp.text[:200]}")
+            log.warning(f"Upload failed: HTTP {resp.status_code} - {resp.text[:200]}")
+            return None
+            
+        try:
+            result = resp.json()
+            log.debug(f"Upload response JSON: {result}")
+        except json.JSONDecodeError:
+            log.warning(f"Upload response not JSON: {resp.text[:200]}")
             return None
 
-        result    = resp.json()
-        file_uuid = result.get("file_uuid") or result.get("id") or result.get("uuid")
+        # Extract file UUID from response - try multiple possible field names
+        file_uuid = None
+        possible_fields = [
+            'file_uuid', 'fileUuid', 'uuid', 'id', 'file_id', 'fileId',
+            ['file', 'uuid'], ['file', 'id'], ['data', 'uuid'], ['data', 'id']
+        ]
+        
+        for field in possible_fields:
+            if isinstance(field, list):
+                # Nested field like result['file']['uuid']
+                temp = result
+                try:
+                    for key in field:
+                        temp = temp[key]
+                    file_uuid = temp
+                    break
+                except (KeyError, TypeError):
+                    continue
+            else:
+                # Direct field like result['file_uuid']
+                file_uuid = result.get(field)
+                if file_uuid:
+                    break
 
         if not file_uuid:
-            log.warning(f"Image upload: no file_uuid in response: {result}")
+            log.warning(f"No file UUID found in upload response: {result}")
             return None
 
-        log.info(f"Uploaded image → file_uuid: {file_uuid[:16]}... ({len(image_data)} bytes)")
+        log.info(f"Image uploaded successfully! UUID: {file_uuid[:16]}... ({len(image_data)}B)")
 
+        # Return attachment object in the format Claude expects
         return {
-            "file_name"    : filename,
-            "file_type"    : mime,
-            "file_size"    : len(image_data),
+            "file_name": filename,
+            "file_type": mime,
+            "file_size": len(image_data),
             "extracted_content": "",
-            "file_uuid"    : file_uuid,
+            "file_uuid": str(file_uuid),
         }
 
-    except Exception as e:
-        log.warning(f"Image upload error: {e}")
+    except requests.exceptions.RequestException as e:
+        log.warning(f"Upload request failed: {e}")
         return None
+    except Exception as e:
+        log.warning(f"Unexpected upload error: {e}")
+        return None
+    finally:
+        # Restore original Content-Type header
+        us.http.headers["Content-Type"] = orig_ct
 
 
 def create_conversation(us: UserSession) -> str:
@@ -1691,7 +1751,10 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
 #               MAIN MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════
 
-@bot.message_handler(content_types=["text", "document", "photo"])
+@bot.message_handler(
+    content_types=["text", "document", "photo"], 
+    func=lambda msg: not (msg.text and msg.text.startswith('/'))
+)
 @auth_check
 def handle_message(msg: Message):
     uid = msg.from_user.id
