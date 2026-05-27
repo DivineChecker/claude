@@ -247,6 +247,7 @@ class UserSession:
     http            : requests.Session = field(default_factory=requests.Session)
     incognito       : bool       = True
     busy            : bool       = False
+    web_search      : bool       = False
     proxy_pool      : ProxyPool  = field(default_factory=lambda: ProxyPool(DEFAULT_PROXIES))
 
     def __post_init__(self):
@@ -508,8 +509,9 @@ def send_message(us: UserSession, text: str, attachments: list = None, status_ms
     payload = {
         "prompt"     : text,
         "timezone"   : "UTC",
-        "attachments": attachments or [],  # list of attachment dicts with file_uuid
+        "attachments": attachments or [],
         "files"      : [],
+        "tools"      : [{"type": "web_search", "name": "web_search"}] if us.web_search else [],
     }
 
     last_error    = None
@@ -899,6 +901,7 @@ Just send any message! Files and images supported.
 /newchat — Start fresh conversation
 /model — Change Claude model
 /incognito — Toggle incognito mode
+/websearch — Toggle web search (experimental)
 /wipe — Delete all tracked chats
 /status — Session info
 /myid — Show your Telegram user ID
@@ -1364,6 +1367,25 @@ def cmd_incognito(msg: Message):
         parse_mode="HTML")
 
 
+# ── Web Search ─────────────────────────────────────────────────────
+
+@bot.message_handler(commands=["websearch"])
+@auth_check
+def cmd_websearch(msg: Message):
+    us            = get_session(msg.from_user.id)
+    us.web_search = not us.web_search
+    state         = "ON 🟢" if us.web_search else "OFF 🔴"
+    bot.reply_to(msg,
+        f"🌐 Web Search: <b>{state}</b>\n\n"
+        + (
+            "✅ Claude will search the web when needed.\n"
+            "<i>⚠️ Experimental — may not work on all accounts.</i>"
+            if us.web_search else
+            "Claude will answer from training data only."
+        ),
+        parse_mode="HTML")
+
+
 # ── Wipe ───────────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["wipe"])
@@ -1400,6 +1422,7 @@ def cmd_status(msg: Message):
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔑 Key      : {'✅ Set' if us.session_key else '❌ Not set'}\n"
         f"🕵️ Incognito : {'🟢 ON' if us.incognito else '🔴 OFF'}\n"
+        f"🌐 WebSearch : {'🟢 ON' if us.web_search else '🔴 OFF'}\n"
         f"🤖 Model    : <code>{us.model}</code>\n"
         f"💬 Current  : {conv}\n"
         f"📋 Tracked  : {len(us.tracked_convs)} conv(s)\n"
@@ -1681,6 +1704,7 @@ def main():
             BotCommand("validate",      "Check if key still works"),
             BotCommand("massvalidate",  "Bulk validate multiple keys"),
             BotCommand("incognito",     "Toggle incognito mode"),
+            BotCommand("websearch",     "Toggle web search (experimental)"),
             BotCommand("wipe",          "Delete all tracked conversations"),
             BotCommand("status",        "Show session info"),
             BotCommand("myid",          "Get your Telegram user ID"),
