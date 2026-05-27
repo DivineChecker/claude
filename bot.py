@@ -4,14 +4,6 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Docker-ready — all config hardcoded below.
 ⚠️ UNOFFICIAL — Uses claude.ai web API. May break at any time.
-
-PROXY COMMANDS (manage from bot — no code changes needed):
-  /addproxy http://user:pass@host:port   — add proxy to pool
-  /proxies                               — list all proxies + active one
-  /delproxy 2                            — remove proxy #2
-  /clearproxies                          — remove all proxies
-  /proxystatus                           — show active proxy + exit IP
-  /nextproxy                             — manually rotate to next proxy
 """
 
 import json
@@ -29,7 +21,6 @@ import urllib.parse
 from typing import Optional
 from dataclasses import dataclass, field
 from collections import defaultdict
-
 import threading
 
 import requests
@@ -38,47 +29,25 @@ from telebot.types import Message, BotCommand
 
 # ═══════════════════════════════════════════════════════════════════
 #                        !! CONFIGURATION !!
-#              Edit these values before building/running
 # ═══════════════════════════════════════════════════════════════════
 
 BOT_TOKEN     = "8891866405:AAFOavJJq6Pv_KMl94JXxH26kistSO4NzqY"
-
-# Allowed Telegram user IDs — leave empty list [] to allow everyone
-ADMIN_IDS     = []                          # e.g. [123456789, 987654321]
-
-DEFAULT_MODEL = "claude-sonnet-4-20250514"  # Claude model to use
-
-# Delete conversations after every reply (max stealth)
+ADMIN_IDS     = []
+DEFAULT_MODEL = "claude-sonnet-4-20250514"
 AUTO_WIPE     = False
-
-# Minimum characters in a code block to send it as a file
 FILE_SIZE_MIN = 200
-
-# Maximum characters per Telegram message (hard limit is 4096)
 MAX_CHUNK     = 4000
-
-# Logging level: DEBUG | INFO | WARNING | ERROR
 LOG_LEVEL     = "INFO"
-
-# ─── Default proxy pool for ALL users (optional) ───────────────────
-# Add proxy URLs here to pre-load them for every user.
-# Leave as empty list [] to start with no proxies.
-# Format: "http://user:pass@host:port" or "socks5://user:pass@host:port"
 DEFAULT_PROXIES: list[str] = []
-
-# ─── Auto-retry on 429 rate limit ──────────────────────────────────
-# How many times to retry before giving up
 RETRY_MAX     = 3
-# Seconds to wait between retries (doubles each attempt: 30 → 60 → 120)
 RETRY_DELAY   = 30
 
 # ═══════════════════════════════════════════════════════════════════
-#                    INTERNAL CONSTANTS (do not touch)
+#                    INTERNAL CONSTANTS
 # ═══════════════════════════════════════════════════════════════════
 
 BASE_URL = "https://claude.ai/api"
 
-# ── Logging setup ─────────────────────────────────────────────────
 os.makedirs("/app/logs", exist_ok=True)
 
 logging.basicConfig(
@@ -91,9 +60,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("ClaudeBot")
 
-# ── Startup validation ────────────────────────────────────────────
 if not BOT_TOKEN or "YOUR_TELEGRAM_BOT_TOKEN_HERE" in BOT_TOKEN:
-    log.critical("BOT_TOKEN is not configured. Edit bot.py and rebuild.")
+    log.critical("BOT_TOKEN is not configured.")
     sys.exit(1)
 
 log.info("━━━ Claude Incognito Telegram Bot ━━━")
@@ -111,12 +79,6 @@ bot = TeleBot(BOT_TOKEN, parse_mode="HTML")
 # ═══════════════════════════════════════════════════════════════════
 
 class ProxyPool:
-    """
-    Manages a rotating pool of proxies.
-    - Automatically rotates to next on failure
-    - Tracks fail counts per proxy
-    - Removes permanently dead proxies after MAX_FAILS failures
-    """
     MAX_FAILS = 3
 
     def __init__(self, proxies: list[str] = None):
@@ -124,15 +86,12 @@ class ProxyPool:
         self._index     : int       = 0
         self._fails     : dict      = defaultdict(int)
 
-    # ── Read ──────────────────────────────────────────────────────
-
     @property
     def count(self) -> int:
         return len(self._proxies)
 
     @property
     def active(self) -> str:
-        """Return the current active proxy URL, or '' if pool is empty."""
         if not self._proxies:
             return ""
         self._index = self._index % len(self._proxies)
@@ -140,22 +99,17 @@ class ProxyPool:
 
     @property
     def active_index(self) -> int:
-        """1-based index of active proxy (for display)."""
         if not self._proxies:
             return 0
         return (self._index % len(self._proxies)) + 1
 
     def all_proxies(self) -> list[tuple[int, str, int]]:
-        """Return [(1-based-index, url, fail_count), ...]"""
         return [
             (i + 1, url, self._fails.get(url, 0))
             for i, url in enumerate(self._proxies)
         ]
 
-    # ── Write ─────────────────────────────────────────────────────
-
     def add(self, proxy_url: str) -> bool:
-        """Add a proxy. Returns False if already in pool."""
         if proxy_url in self._proxies:
             return False
         self._proxies.append(proxy_url)
@@ -163,13 +117,11 @@ class ProxyPool:
         return True
 
     def remove(self, index_1based: int) -> Optional[str]:
-        """Remove proxy by 1-based index. Returns removed URL or None."""
         idx = index_1based - 1
         if idx < 0 or idx >= len(self._proxies):
             return None
         removed = self._proxies.pop(idx)
         self._fails.pop(removed, None)
-        # Adjust current index
         if self._proxies:
             self._index = self._index % len(self._proxies)
         else:
@@ -178,16 +130,12 @@ class ProxyPool:
         return removed
 
     def clear(self):
-        """Remove all proxies."""
         self._proxies.clear()
         self._fails.clear()
         self._index = 0
         log.info("Proxy pool cleared")
 
-    # ── Rotation ──────────────────────────────────────────────────
-
     def rotate(self) -> str:
-        """Move to next proxy. Returns new active proxy URL."""
         if len(self._proxies) <= 1:
             return self.active
         self._index = (self._index + 1) % len(self._proxies)
@@ -195,10 +143,6 @@ class ProxyPool:
         return self.active
 
     def mark_failed(self, proxy_url: str) -> bool:
-        """
-        Mark a proxy as failed. Auto-removes after MAX_FAILS.
-        Returns True if proxy was removed from pool.
-        """
         if proxy_url not in self._proxies:
             return False
         self._fails[proxy_url] += 1
@@ -212,20 +156,17 @@ class ProxyPool:
                 self._index = self._index % len(self._proxies)
             else:
                 self._index = 0
-            log.warning(f"Proxy permanently removed (too many failures): {_mask_proxy(proxy_url)}")
+            log.warning(f"Proxy permanently removed: {_mask_proxy(proxy_url)}")
             return True
-        # Rotate away from the failed proxy
         if len(self._proxies) > 1:
             self.rotate()
         return False
 
     def mark_success(self, proxy_url: str):
-        """Reset fail count on success."""
         if proxy_url in self._fails:
             self._fails[proxy_url] = 0
 
     def as_requests_dict(self) -> dict:
-        """Return proxies dict for requests, or {} if no proxies."""
         url = self.active
         if not url:
             return {}
@@ -261,7 +202,7 @@ class UserSession:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            "Accept"                : "*/*",
+            "Accept"                : "text/event-stream, */*",
             "Accept-Language"       : "en-US,en;q=0.9",
             "Accept-Encoding"       : "gzip, deflate, br",
             "Content-Type"          : "application/json",
@@ -273,14 +214,13 @@ class UserSession:
             "Sec-Fetch-Dest"        : "empty",
             "Sec-Fetch-Mode"        : "cors",
             "Sec-Fetch-Site"        : "same-origin",
+            "anthropic-client-platform" : "web_claude_ai",
         })
 
     def _sync_proxy(self):
-        """Sync requests.Session proxies from the pool's active proxy."""
         self.http.proxies = self.proxy_pool.as_requests_dict()
 
     def rotate_proxy(self) -> str:
-        """Rotate to next proxy and sync session."""
         url = self.proxy_pool.rotate()
         self._sync_proxy()
         return url
@@ -298,7 +238,6 @@ class UserSession:
         log.debug(f"Session key set: {key[:20]}...")
 
 
-# Global store: { telegram_user_id: UserSession }
 sessions: dict[int, UserSession] = {}
 
 
@@ -313,7 +252,6 @@ def get_session(uid: int) -> UserSession:
 # ═══════════════════════════════════════════════════════════════════
 
 def _mask_proxy(proxy_url: str) -> str:
-    """Mask password in proxy URL for safe logging/display."""
     if not proxy_url:
         return ""
     try:
@@ -326,10 +264,6 @@ def _mask_proxy(proxy_url: str) -> str:
 
 
 def _parse_proxy_url(proxy_url: str) -> tuple[bool, str]:
-    """
-    Validate a proxy URL.
-    Returns (is_valid, error_message).
-    """
     try:
         p = urllib.parse.urlparse(proxy_url)
         if p.scheme not in ("http", "https", "socks5", "socks4"):
@@ -347,10 +281,6 @@ def _parse_proxy_url(proxy_url: str) -> tuple[bool, str]:
 
 
 def _test_proxy(proxy_url: str) -> tuple[bool, str, str]:
-    """
-    Test proxy by fetching exit IP from api.ipify.org.
-    Returns (success, ip_address, error_message).
-    """
     try:
         s = requests.Session()
         if proxy_url:
@@ -372,10 +302,6 @@ def _test_proxy(proxy_url: str) -> tuple[bool, str, str]:
 # ═══════════════════════════════════════════════════════════════════
 
 def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]:
-    """
-    Validate a Claude session key.
-    Returns (is_valid, org_id, org_name_or_error).
-    """
     s = requests.Session()
     s.headers.update({
         "User-Agent"         : (
@@ -394,6 +320,7 @@ def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]
         "Sec-Fetch-Dest"     : "empty",
         "Sec-Fetch-Mode"     : "cors",
         "Sec-Fetch-Site"     : "same-origin",
+        "anthropic-client-platform" : "web_claude_ai",
     })
     s.cookies.set("sessionKey", session_key, domain=".claude.ai", path="/", secure=True)
     if proxy_url:
@@ -416,7 +343,6 @@ def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]
         org_name = orgs[0].get("name", "Unknown Org")
         org_id   = orgs[0]["uuid"]
 
-        # Also test chat_conversations endpoint
         conv_resp = s.post(
             f"{BASE_URL}/organizations/{org_id}/chat_conversations",
             json    = {"uuid": str(uuid.uuid4()), "name": "", "model": DEFAULT_MODEL},
@@ -424,12 +350,11 @@ def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]
         )
 
         if conv_resp.status_code == 403:
-            return False, "", "Key valid for auth but blocked for chat (403) — IP may be blocked, add a proxy"
+            return False, "", "Key valid for auth but blocked for chat (403) — IP may be blocked"
 
         if conv_resp.status_code not in (200, 201):
             return False, "", f"Cannot create conversations (HTTP {conv_resp.status_code})"
 
-        # Clean up test conversation
         test_id = conv_resp.json().get("uuid")
         if test_id:
             try:
@@ -451,7 +376,6 @@ def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]
 
 
 def create_conversation(us: UserSession) -> str:
-    """Create a new blank conversation."""
     url = f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations"
     resp = us.http.post(
         url,
@@ -468,7 +392,6 @@ def create_conversation(us: UserSession) -> str:
 
 
 def delete_conversation(us: UserSession, conv_id: str) -> bool:
-    """Silently delete a conversation."""
     try:
         r = us.http.delete(
             f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations/{conv_id}",
@@ -483,7 +406,6 @@ def delete_conversation(us: UserSession, conv_id: str) -> bool:
 
 
 def wipe_all(us: UserSession):
-    """Delete every tracked conversation."""
     count = len(us.tracked_convs)
     for cid in list(us.tracked_convs):
         delete_conversation(us, cid)
@@ -492,112 +414,126 @@ def wipe_all(us: UserSession):
     log.info(f"Wiped {count} conversation(s)")
 
 
-def send_message(us: UserSession, text: str, attachments: list = None, status_msg=None, chat_id: int = None) -> dict:
+def _stream_completion(us: UserSession, url: str, payload: dict) -> str:
     """
-    Send a message to Claude with:
-    - Automatic proxy rotation on proxy failure
-    - Auto-retry with backoff on 429 rate limit
+    POST to a streaming SSE endpoint and return the full assembled text.
+    Handles both /completion and the newer /chat_conversations/.../messages endpoints.
+    """
+    resp = us.http.post(url, json=payload, stream=True, timeout=120)
+    resp.raise_for_status()
+
+    full_text   = ""
+    in_thinking = False  # skip <thinking> blocks if present
+
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+
+        # SSE format: "data: {...}"
+        if line.startswith("data: "):
+            raw = line[6:].strip()
+            if raw in ("", "[DONE]"):
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                log.debug(f"Non-JSON SSE line: {raw[:80]}")
+                continue
+
+            etype = event.get("type", "")
+
+            # ── Standard /completion format ────────────────────────
+            if etype == "completion":
+                chunk = event.get("completion", "")
+                full_text += chunk
+
+            # ── Newer message-streaming format ─────────────────────
+            elif etype == "content_block_start":
+                block = event.get("content_block", {})
+                btype = block.get("type", "")
+                if btype == "thinking":
+                    in_thinking = True
+                elif btype == "text":
+                    in_thinking = False
+                    # block may already have text
+                    full_text += block.get("text", "")
+
+            elif etype == "content_block_delta":
+                delta = event.get("delta", {})
+                dtype = delta.get("type", "")
+                if dtype == "thinking_delta":
+                    in_thinking = True   # still in thinking
+                elif dtype == "text_delta":
+                    in_thinking = False
+                    full_text += delta.get("text", "")
+
+            elif etype == "content_block_stop":
+                in_thinking = False
+
+            elif etype == "message_delta":
+                # stop_reason etc — ignore
+                pass
+
+            elif etype == "message_stop":
+                break
+
+            elif etype == "error":
+                err_detail = event.get("error", {})
+                msg_str    = err_detail.get("message", str(err_detail))
+                raise RuntimeError(f"Claude error: {msg_str}")
+
+            elif etype == "ping":
+                pass  # heartbeat, ignore
+
+        # Some endpoints emit bare JSON lines (no "data:" prefix)
+        elif line.startswith("{"):
+            try:
+                event = json.loads(line)
+                if event.get("type") == "completion":
+                    full_text += event.get("completion", "")
+                elif event.get("type") == "error":
+                    raise RuntimeError(event.get("error", {}).get("message", "Unknown error"))
+            except json.JSONDecodeError:
+                pass
+
+    return full_text
+
+
+def send_message(
+    us         : UserSession,
+    text       : str,
+    attachments: list = None,
+    status_msg = None,
+    chat_id    : int  = None,
+) -> dict:
+    """
+    Send a message to Claude.
+    - Uses /completion for normal chat
+    - Uses the proper tool-calling endpoint for web search
     Returns { 'text': str, 'files': list }
     """
     if not us.conversation_id:
         create_conversation(us)
 
-    url = (
-        f"{BASE_URL}/organizations/{us.organization_id}"
-        f"/chat_conversations/{us.conversation_id}/completion"
-    )
-    payload = {
-        "prompt"     : text,
-        "timezone"   : "UTC",
-        "attachments": attachments or [],
-        "files"      : [],
-        "tools"      : [{"type": "web_search", "name": "web_search"}] if us.web_search else [],
-    }
-
-    last_error    = None
-    retry_delay   = RETRY_DELAY
+    last_error  = None
+    retry_delay = RETRY_DELAY
 
     for attempt in range(1, RETRY_MAX + 1):
         current_proxy = us.proxy_pool.active
 
         try:
-            # Sync proxy before each attempt
             us._sync_proxy()
-
             log.debug(
                 f"Attempt {attempt}/{RETRY_MAX} | "
                 f"Proxy: {_mask_proxy(current_proxy) or 'direct'} | "
+                f"WebSearch: {us.web_search} | "
                 f"Conv: {us.conversation_id[:12]}"
             )
 
-            resp = us.http.post(url, json=payload, stream=True, timeout=120)
-
-            # ── 429 Rate Limited ──────────────────────────────────
-            if resp.status_code == 429:
-                log.warning(f"429 rate limit on attempt {attempt}/{RETRY_MAX}")
-                if attempt < RETRY_MAX:
-                    wait = retry_delay * attempt
-                    log.info(f"Waiting {wait}s before retry…")
-                    if status_msg and chat_id:
-                        try:
-                            bot.edit_message_text(
-                                f"⏳ <i>Rate limited by Claude — retrying in {wait}s… (attempt {attempt}/{RETRY_MAX})</i>",
-                                chat_id    = chat_id,
-                                message_id = status_msg.message_id,
-                                parse_mode = "HTML",
-                            )
-                        except Exception:
-                            pass
-                    time.sleep(wait)
-                    # Rotate proxy on rate limit too — different proxy = different exit IP = separate rate limit bucket
-                    if us.proxy_pool.count > 1:
-                        new_proxy = us.rotate_proxy()
-                        log.info(f"Rotated proxy after 429: {_mask_proxy(new_proxy)}")
-                    continue
-                last_error = requests.exceptions.HTTPError(response=resp, request=resp.request)
-                break
-
-            # ── 403 Forbidden ─────────────────────────────────────
-            if resp.status_code == 403:
-                log.error(f"403 on attempt {attempt} with proxy {_mask_proxy(current_proxy)}")
-                if current_proxy:
-                    us.proxy_pool.mark_failed(current_proxy)
-                    if us.proxy_pool.count > 0:
-                        new_proxy = us.proxy_pool.active
-                        us._sync_proxy()
-                        log.info(f"Switched to proxy: {_mask_proxy(new_proxy)}")
-                        if status_msg and chat_id and attempt < RETRY_MAX:
-                            try:
-                                bot.edit_message_text(
-                                    f"⚠️ <i>Proxy blocked — switching to backup proxy… (attempt {attempt}/{RETRY_MAX})</i>",
-                                    chat_id    = chat_id,
-                                    message_id = status_msg.message_id,
-                                    parse_mode = "HTML",
-                                )
-                            except Exception:
-                                pass
-                        if attempt < RETRY_MAX:
-                            time.sleep(2)
-                            continue
-                last_error = requests.exceptions.HTTPError(response=resp, request=resp.request)
-                break
-
-            resp.raise_for_status()
-
-            # ── Stream response ───────────────────────────────────
-            full_text = ""
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
-                    continue
-                try:
-                    event = json.loads(line[6:])
-                    etype = event.get("type", "")
-                    if etype == "completion":
-                        full_text += event.get("completion", "")
-                    elif etype == "error":
-                        raise RuntimeError(event.get("error", {}).get("message", "Unknown error"))
-                except json.JSONDecodeError:
-                    continue
+            if us.web_search:
+                full_text = _send_with_web_search(us, text, attachments or [])
+            else:
+                full_text = _send_completion(us, text, attachments or [])
 
             # ── Success ───────────────────────────────────────────
             us.proxy_pool.mark_success(current_proxy)
@@ -610,30 +546,85 @@ def send_message(us: UserSession, text: str, attachments: list = None, status_ms
 
             return {"text": full_text, "files": extract_code_files(full_text)}
 
-        except requests.exceptions.ProxyError as e:
-            log.error(f"Proxy error on attempt {attempt}: {e}")
-            if current_proxy:
-                removed = us.proxy_pool.mark_failed(current_proxy)
-                if us.proxy_pool.count > 0:
-                    us._sync_proxy()
-                    if status_msg and chat_id and attempt < RETRY_MAX:
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code if e.response is not None else 0
+
+            # ── 429 Rate Limited ──────────────────────────────────
+            if code == 429:
+                log.warning(f"429 rate limit on attempt {attempt}/{RETRY_MAX}")
+                if attempt < RETRY_MAX:
+                    wait = retry_delay * attempt
+                    log.info(f"Waiting {wait}s before retry…")
+                    if status_msg and chat_id:
                         try:
                             bot.edit_message_text(
-                                f"⚠️ <i>Proxy error — switching to backup… (attempt {attempt}/{RETRY_MAX})</i>",
+                                f"⏳ <i>Rate limited — retrying in {wait}s… ({attempt}/{RETRY_MAX})</i>",
                                 chat_id    = chat_id,
                                 message_id = status_msg.message_id,
                                 parse_mode = "HTML",
                             )
                         except Exception:
                             pass
+                    time.sleep(wait)
+                    if us.proxy_pool.count > 1:
+                        new_proxy = us.rotate_proxy()
+                        log.info(f"Rotated proxy after 429: {_mask_proxy(new_proxy)}")
+                    continue
+                last_error = e
+                break
+
+            # ── 403 Forbidden ─────────────────────────────────────
+            if code == 403:
+                log.error(f"403 on attempt {attempt} proxy={_mask_proxy(current_proxy)}")
+                if current_proxy:
+                    us.proxy_pool.mark_failed(current_proxy)
+                    if us.proxy_pool.count > 0:
+                        us._sync_proxy()
+                        if status_msg and chat_id and attempt < RETRY_MAX:
+                            try:
+                                bot.edit_message_text(
+                                    f"⚠️ <i>Proxy blocked — switching… ({attempt}/{RETRY_MAX})</i>",
+                                    chat_id    = chat_id,
+                                    message_id = status_msg.message_id,
+                                    parse_mode = "HTML",
+                                )
+                            except Exception:
+                                pass
+                        if attempt < RETRY_MAX:
+                            time.sleep(2)
+                            continue
+                last_error = e
+                break
+
+            # ── 400 Bad Request ───────────────────────────────────
+            if code == 400:
+                body = ""
+                try:
+                    body = e.response.text[:300]
+                except Exception:
+                    pass
+                log.error(f"400 Bad Request: {body}")
+                raise RuntimeError(
+                    f"Bad request (HTTP 400).\n"
+                    f"Details: {body}\n"
+                    f"This usually means the API payload is malformed."
+                )
+
+            last_error = e
+            break
+
+        except requests.exceptions.ProxyError as e:
+            log.error(f"Proxy error on attempt {attempt}: {e}")
+            if current_proxy:
+                us.proxy_pool.mark_failed(current_proxy)
+                if us.proxy_pool.count > 0:
+                    us._sync_proxy()
                     if attempt < RETRY_MAX:
                         time.sleep(2)
                         last_error = e
                         continue
             raise RuntimeError(
-                f"All proxies failed or no proxy set.\n"
-                f"Add more proxies with /addproxy\n"
-                f"Last error: {e}"
+                f"All proxies failed.\nAdd more with /addproxy\nLast error: {e}"
             )
 
         except requests.exceptions.Timeout as e:
@@ -652,10 +643,144 @@ def send_message(us: UserSession, text: str, attachments: list = None, status_ms
             last_error = e
             break
 
-    # All retries exhausted
     if last_error:
         raise last_error
     raise RuntimeError("Failed after all retries")
+
+
+def _send_completion(us: UserSession, text: str, attachments: list) -> str:
+    """Standard /completion endpoint — no tools."""
+    url = (
+        f"{BASE_URL}/organizations/{us.organization_id}"
+        f"/chat_conversations/{us.conversation_id}/completion"
+    )
+    payload = {
+        "prompt"      : text,
+        "timezone"    : "UTC",
+        "attachments" : attachments,
+        "files"       : [],
+    }
+    return _stream_completion(us, url, payload)
+
+
+def _send_with_web_search(us: UserSession, text: str, attachments: list) -> str:
+    """
+    Web-search enabled path.
+
+    Claude's web UI sends tool-enabled messages to:
+      POST /api/organizations/{org}/chat_conversations/{conv}/completion
+    with a `tools` key — BUT the format that actually works uses the
+    newer `messages` array style.  We try the /completion endpoint first
+    (with tools), and fall back to the plain completion if we get a 400.
+    """
+    url = (
+        f"{BASE_URL}/organizations/{us.organization_id}"
+        f"/chat_conversations/{us.conversation_id}/completion"
+    )
+
+    # This is the payload shape Claude's own web frontend sends
+    payload = {
+        "prompt"      : text,
+        "timezone"    : "UTC",
+        "attachments" : attachments,
+        "files"       : [],
+        "tools"       : [
+            {
+                "type"        : "computer_20250124",  # internal tool namespace
+                "name"        : "web_search",
+                "display_name": "Web search",
+            }
+        ],
+        "feature_flags": ["web_search"],
+    }
+
+    try:
+        resp = us.http.post(url, json=payload, stream=True, timeout=120)
+
+        # 400 → the tools format isn't accepted; fall back gracefully
+        if resp.status_code == 400:
+            log.warning(
+                "Web search returned 400 — falling back to plain completion. "
+                "Web search may not be enabled for this account/region."
+            )
+            return _send_completion(us, text, attachments)
+
+        resp.raise_for_status()
+        return _parse_web_search_stream(resp)
+
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if e.response is not None else 0
+        if code == 400:
+            log.warning("Web search 400 — falling back to plain completion.")
+            return _send_completion(us, text, attachments)
+        raise
+
+
+def _parse_web_search_stream(resp: requests.Response) -> str:
+    """
+    Parse the SSE stream from a web-search-enabled completion.
+    The stream includes regular text deltas interleaved with
+    tool_use / tool_result blocks — we collect only the text.
+    """
+    full_text   = ""
+    in_tool     = False   # inside a tool_use block
+    in_thinking = False
+
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+
+        if line.startswith("data: "):
+            raw = line[6:].strip()
+            if raw in ("", "[DONE]"):
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            etype = event.get("type", "")
+
+            if etype == "completion":
+                # Old-style — just append
+                if not in_tool:
+                    full_text += event.get("completion", "")
+
+            elif etype == "content_block_start":
+                block = event.get("content_block", {})
+                btype = block.get("type", "")
+                if btype == "tool_use":
+                    in_tool     = True
+                    in_thinking = False
+                elif btype == "thinking":
+                    in_thinking = True
+                    in_tool     = False
+                elif btype == "text":
+                    in_tool     = False
+                    in_thinking = False
+                    full_text  += block.get("text", "")
+
+            elif etype == "content_block_delta":
+                if in_tool or in_thinking:
+                    pass  # skip tool calls and thinking
+                else:
+                    delta = event.get("delta", {})
+                    dtype = delta.get("type", "")
+                    if dtype == "text_delta":
+                        full_text += delta.get("text", "")
+
+            elif etype == "content_block_stop":
+                in_tool     = False
+                in_thinking = False
+
+            elif etype == "message_stop":
+                break
+
+            elif etype == "error":
+                err_detail = event.get("error", {})
+                raise RuntimeError(f"Claude error: {err_detail.get('message', str(err_detail))}")
+
+    return full_text
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -695,7 +820,6 @@ LANG_EXTENSIONS = {
 
 
 def extract_code_files(text: str) -> list:
-    """Extract large code blocks as sendable files."""
     pattern = r"```(\w+)?\n(.*?)```"
     matches = re.findall(pattern, text, re.DOTALL)
     files   = []
@@ -800,7 +924,11 @@ def smart_split(text: str, max_len: int = MAX_CHUNK) -> list[str]:
 
 
 def _fix_unclosed_tags(chunk: str) -> str:
-    for open_tag, close_tag in [("<pre>","</pre>"),("<code>","</code>"),("<b>","</b>"),("<i>","</i>"),("<s>","</s>")]:
+    for open_tag, close_tag in [
+        ("<pre>","</pre>"), ("<code>","</code>"),
+        ("<b>","</b>"),     ("<i>","</i>"),
+        ("<s>","</s>"),
+    ]:
         opens  = chunk.count(open_tag)
         closes = chunk.count(close_tag)
         if opens > closes:
@@ -826,7 +954,10 @@ def send_chunked(chat_id: int, text: str, reply_to: int = None):
         except apihelper.ApiTelegramException as e:
             if "can't parse entities" in str(e).lower():
                 plain = re.sub(r"<[^>]+>", "", chunk)
-                bot.send_message(chat_id, plain, reply_to_message_id=reply_to if i == 0 else None)
+                bot.send_message(
+                    chat_id, plain,
+                    reply_to_message_id = reply_to if i == 0 else None,
+                )
             else:
                 raise
         if i < total - 1:
@@ -886,7 +1017,7 @@ def cmd_start(msg: Message):
 /validate — Check if current key works
 /massvalidate — Bulk validate multiple keys
 
-<b>━━━ Proxy Pool (fix VPS 403 / rotate IPs) ━━━</b>
+<b>━━━ Proxy Pool ━━━</b>
 /addproxy <code>&lt;url&gt;</code> — Add proxy to rotation pool
 /proxies — List all proxies + which is active
 /delproxy <code>&lt;number&gt;</code> — Remove proxy by number
@@ -895,21 +1026,16 @@ def cmd_start(msg: Message):
 /nextproxy — Manually rotate to next proxy
 
 <b>━━━ Chat ━━━</b>
-Just send any message! Files and images supported.
+Just send any message! Files supported.
 
 <b>━━━ Controls ━━━</b>
 /newchat — Start fresh conversation
 /model — Change Claude model
 /incognito — Toggle incognito mode
-/websearch — Toggle web search (experimental)
+/websearch — Toggle web search
 /wipe — Delete all tracked chats
 /status — Session info
 /myid — Show your Telegram user ID
-
-<b>━━━ Proxy Format ━━━</b>
-<code>http://user:pass@host:port</code>
-<code>socks5://user:pass@host:port</code>
-<code>http://host:port</code>  (no auth)
 
 <b>━━━ Get Session Key ━━━</b>
 1. Go to <a href="https://claude.ai">claude.ai</a> and login
@@ -921,10 +1047,10 @@ Just send any message! Files and images supported.
 
 @bot.message_handler(commands=["myid"])
 def cmd_myid(msg: Message):
-    bot.reply_to(msg, f"🪪 Your Telegram ID: <code>{msg.from_user.id}</code>", parse_mode="HTML")
+    bot.reply_to(msg,
+        f"🪪 Your Telegram ID: <code>{msg.from_user.id}</code>",
+        parse_mode="HTML")
 
-
-# ── Set Key ────────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["setkey"])
 @auth_check
@@ -932,8 +1058,7 @@ def cmd_setkey(msg: Message):
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         bot.reply_to(msg,
-            "⚠️ <b>Usage:</b> /setkey <code>&lt;session_key&gt;</code>\n\n"
-            "Get from claude.ai → F12 → Application → Cookies → <code>sessionKey</code>",
+            "⚠️ <b>Usage:</b> /setkey <code>&lt;session_key&gt;</code>",
             parse_mode="HTML")
         return
 
@@ -948,7 +1073,6 @@ def cmd_setkey(msg: Message):
 
     thinking = bot.send_message(msg.chat.id, "🔄 <i>Validating key…</i>", parse_mode="HTML")
 
-    # Use active proxy from pool for validation
     valid, org_id, info = validate_key(key, proxy_url=us.proxy_pool.active)
 
     try:
@@ -989,12 +1113,9 @@ def cmd_setkey(msg: Message):
         parse_mode="HTML")
 
 
-# ── Proxy Pool Commands ────────────────────────────────────────────
-
 @bot.message_handler(commands=["addproxy"])
 @auth_check
 def cmd_addproxy(msg: Message):
-    """Add a proxy to the rotation pool."""
     parts = msg.text.split(maxsplit=1)
     uid   = msg.from_user.id
 
@@ -1003,15 +1124,12 @@ def cmd_addproxy(msg: Message):
             "🌐 <b>Add Proxy to Pool</b>\n\n"
             "<b>Usage:</b>\n"
             "<code>/addproxy http://user:pass@host:port</code>\n"
-            "<code>/addproxy socks5://user:pass@host:port</code>\n\n"
-            "You can add multiple proxies — they rotate automatically on failure.\n"
-            "Use /proxies to see the full pool.",
+            "<code>/addproxy socks5://user:pass@host:port</code>",
             parse_mode="HTML")
         return
 
     proxy_url = parts[1].strip()
 
-    # Delete message — may contain credentials
     try:
         bot.delete_message(msg.chat.id, msg.message_id)
     except Exception:
@@ -1020,8 +1138,7 @@ def cmd_addproxy(msg: Message):
     valid, err = _parse_proxy_url(proxy_url)
     if not valid:
         bot.send_message(msg.chat.id,
-            f"❌ <b>Invalid proxy URL</b>\n\nError: <code>{html_lib.escape(err)}</code>\n\n"
-            f"Format: <code>http://user:pass@host:port</code>",
+            f"❌ <b>Invalid proxy URL</b>\n\nError: <code>{html_lib.escape(err)}</code>",
             parse_mode="HTML")
         return
 
@@ -1039,7 +1156,7 @@ def cmd_addproxy(msg: Message):
             parse_mode="HTML")
         return
 
-    us = get_session(uid)
+    us    = get_session(uid)
     added = us.proxy_pool.add(proxy_url)
     us._sync_proxy()
 
@@ -1049,22 +1166,18 @@ def cmd_addproxy(msg: Message):
             parse_mode="HTML")
         return
 
-    log.info(f"User {uid} added proxy #{us.proxy_pool.count}: {_mask_proxy(proxy_url)} → IP: {ip}")
-
     bot.send_message(msg.chat.id,
         f"✅ <b>Proxy #{us.proxy_pool.count} added!</b>\n\n"
         f"🌐 Proxy  : <code>{html_lib.escape(_mask_proxy(proxy_url))}</code>\n"
         f"📍 Exit IP: <code>{html_lib.escape(ip)}</code>\n"
         f"🔄 Pool   : <b>{us.proxy_pool.count}</b> proxy(s) total\n\n"
-        f"<i>🔐 Proxy message deleted for security.</i>\n\n"
-        f"Use /proxies to see the full pool.",
+        f"<i>🔐 Proxy message deleted for security.</i>",
         parse_mode="HTML")
 
 
 @bot.message_handler(commands=["proxies"])
 @auth_check
 def cmd_proxies(msg: Message):
-    """List all proxies in the pool."""
     us = get_session(msg.from_user.id)
 
     if us.proxy_pool.count == 0:
@@ -1076,7 +1189,7 @@ def cmd_proxies(msg: Message):
 
     lines = []
     for idx, url, fails in us.proxy_pool.all_proxies():
-        active_marker = " ◀ <b>ACTIVE</b>" if idx == us.proxy_pool.active_index else ""
+        active_marker  = " ◀ <b>ACTIVE</b>" if idx == us.proxy_pool.active_index else ""
         fail_indicator = f" ⚠️ {fails} fail(s)" if fails > 0 else ""
         lines.append(
             f"<b>#{idx}</b> <code>{html_lib.escape(_mask_proxy(url))}</code>"
@@ -1084,18 +1197,15 @@ def cmd_proxies(msg: Message):
         )
 
     bot.reply_to(msg,
-        f"🌐 <b>Proxy Pool</b> ({us.proxy_pool.count} total)\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 <b>Proxy Pool</b> ({us.proxy_pool.count} total)\n━━━━━━━━━━━━━━━━━\n"
         + "\n".join(lines) + "\n\n"
-        f"<i>Proxies auto-rotate on failure.\n"
-        f"Remove one: /delproxy &lt;number&gt;</i>",
+        "<i>Remove one: /delproxy &lt;number&gt;</i>",
         parse_mode="HTML")
 
 
 @bot.message_handler(commands=["delproxy"])
 @auth_check
 def cmd_delproxy(msg: Message):
-    """Remove a proxy by its number from the pool."""
     parts = msg.text.split(maxsplit=1)
     uid   = msg.from_user.id
     us    = get_session(uid)
@@ -1106,9 +1216,8 @@ def cmd_delproxy(msg: Message):
 
     if len(parts) < 2 or not parts[1].strip().isdigit():
         bot.reply_to(msg,
-            f"⚠️ <b>Usage:</b> /delproxy <code>&lt;number&gt;</code>\n\n"
-            f"Use /proxies to see proxy numbers.\n"
-            f"Current pool has <b>{us.proxy_pool.count}</b> proxy(s).",
+            f"⚠️ <b>Usage:</b> /delproxy <code>&lt;number&gt;</code>\n"
+            f"Pool has <b>{us.proxy_pool.count}</b> proxy(s). Use /proxies to see numbers.",
             parse_mode="HTML")
         return
 
@@ -1118,23 +1227,20 @@ def cmd_delproxy(msg: Message):
 
     if removed is None:
         bot.reply_to(msg,
-            f"❌ No proxy #{idx}. Pool has <b>{us.proxy_pool.count}</b> proxy(s).\nUse /proxies to see numbers.",
+            f"❌ No proxy #{idx}. Pool has <b>{us.proxy_pool.count}</b>.",
             parse_mode="HTML")
         return
 
-    log.info(f"User {uid} removed proxy #{idx}: {_mask_proxy(removed)}")
-
     bot.reply_to(msg,
-        f"🗑 <b>Proxy #{idx} removed.</b>\n\n"
+        f"🗑 <b>Proxy #{idx} removed.</b>\n"
         f"Removed: <code>{html_lib.escape(_mask_proxy(removed))}</code>\n"
-        f"Remaining: <b>{us.proxy_pool.count}</b> proxy(s) in pool",
+        f"Remaining: <b>{us.proxy_pool.count}</b>",
         parse_mode="HTML")
 
 
 @bot.message_handler(commands=["clearproxies"])
 @auth_check
 def cmd_clearproxies(msg: Message):
-    """Remove all proxies from the pool."""
     uid = msg.from_user.id
     us  = get_session(uid)
 
@@ -1145,11 +1251,9 @@ def cmd_clearproxies(msg: Message):
     count = us.proxy_pool.count
     us.proxy_pool.clear()
     us._sync_proxy()
-    log.info(f"User {uid} cleared all {count} proxies")
 
     bot.reply_to(msg,
-        f"🗑 <b>All {count} proxy(s) removed.</b>\n\n"
-        f"Requests will now go directly from this server.\n"
+        f"🗑 <b>All {count} proxy(s) removed.</b>\n"
         f"Add new proxies with /addproxy",
         parse_mode="HTML")
 
@@ -1157,7 +1261,6 @@ def cmd_clearproxies(msg: Message):
 @bot.message_handler(commands=["nextproxy"])
 @auth_check
 def cmd_nextproxy(msg: Message):
-    """Manually rotate to the next proxy."""
     uid = msg.from_user.id
     us  = get_session(uid)
 
@@ -1167,62 +1270,56 @@ def cmd_nextproxy(msg: Message):
 
     if us.proxy_pool.count == 1:
         bot.reply_to(msg,
-            f"ℹ️ Only 1 proxy in pool — nothing to rotate to.\n"
+            f"ℹ️ Only 1 proxy — nothing to rotate.\n"
             f"Active: <code>{html_lib.escape(_mask_proxy(us.proxy_pool.active))}</code>",
             parse_mode="HTML")
         return
 
     new_proxy = us.rotate_proxy()
-    log.info(f"User {uid} manually rotated to proxy #{us.proxy_pool.active_index}")
-
     bot.send_chat_action(msg.chat.id, "typing")
     ok, ip, err = _test_proxy(new_proxy)
 
     bot.reply_to(msg,
         f"🔄 <b>Rotated to proxy #{us.proxy_pool.active_index}</b>\n\n"
         f"🌐 Proxy  : <code>{html_lib.escape(_mask_proxy(new_proxy))}</code>\n"
-        + (f"📍 Exit IP: <code>{html_lib.escape(ip)}</code>" if ok else f"⚠️ Test failed: <code>{html_lib.escape(err)}</code>"),
+        + (f"📍 Exit IP: <code>{html_lib.escape(ip)}</code>"
+           if ok else
+           f"⚠️ Test failed: <code>{html_lib.escape(err)}</code>"),
         parse_mode="HTML")
 
 
 @bot.message_handler(commands=["proxystatus"])
 @auth_check
 def cmd_proxystatus(msg: Message):
-    """Show active proxy info and exit IP."""
     uid = msg.from_user.id
     us  = get_session(uid)
 
     bot.send_chat_action(msg.chat.id, "typing")
 
-    active = us.proxy_pool.active
+    active     = us.proxy_pool.active
     ok, ip, err = _test_proxy(active)
 
-    if us.proxy_pool.count == 0:
-        pool_line = "🔄 Pool   : <i>Empty — add with /addproxy</i>"
-    else:
-        pool_line = f"🔄 Pool   : <b>{us.proxy_pool.count}</b> proxy(s), active #{us.proxy_pool.active_index}"
-
+    pool_line  = (
+        f"🔄 Pool   : <b>{us.proxy_pool.count}</b> proxy(s), active #{us.proxy_pool.active_index}"
+        if us.proxy_pool.count > 0 else
+        "🔄 Pool   : <i>Empty — add with /addproxy</i>"
+    )
     proxy_line = (
         f"🌐 Active  : <code>{html_lib.escape(_mask_proxy(active))}</code>"
         if active else
         "🌐 Active  : <i>None (direct connection)</i>"
     )
-    ip_line = (
+    ip_line    = (
         f"📍 Exit IP : <code>{html_lib.escape(ip)}</code>"
         if ok else
         f"📍 Exit IP : ❌ <code>{html_lib.escape(err)}</code>"
     )
 
     bot.reply_to(msg,
-        f"📊 <b>Proxy Status</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"{proxy_line}\n"
-        f"{ip_line}\n"
-        f"{pool_line}",
+        f"📊 <b>Proxy Status</b>\n━━━━━━━━━━━━━━━━━\n"
+        f"{proxy_line}\n{ip_line}\n{pool_line}",
         parse_mode="HTML")
 
-
-# ── Validate ───────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["validate"])
 @auth_check
@@ -1251,11 +1348,9 @@ def cmd_validate(msg: Message):
             f"❌ <b>Session Key Invalid</b>\n\n"
             f"Error: <code>{html_lib.escape(info)}</code>\n\n"
             f"Use /setkey to reconfigure."
-            + ("\n\n💡 Add proxies with /addproxy to bypass IP blocks." if us.proxy_pool.count == 0 else ""),
+            + ("\n\n💡 Add proxies with /addproxy" if us.proxy_pool.count == 0 else ""),
             parse_mode="HTML")
 
-
-# ── Mass Validate ──────────────────────────────────────────────────
 
 @bot.message_handler(commands=["massvalidate"])
 @auth_check
@@ -1263,8 +1358,7 @@ def cmd_massvalidate(msg: Message):
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         bot.reply_to(msg,
-            "📋 <b>Mass Key Validator</b>\n\n"
-            "One key per line:\n\n"
+            "📋 <b>Mass Key Validator</b>\n\nOne key per line:\n\n"
             "<code>/massvalidate\nsk-ant-sid01-key1...\nsk-ant-sid01-key2...</code>",
             parse_mode="HTML")
         return
@@ -1278,7 +1372,11 @@ def cmd_massvalidate(msg: Message):
     except Exception:
         pass
 
-    status_msg = bot.send_message(msg.chat.id, f"🔄 Validating <b>{total}</b> key(s)…", parse_mode="HTML")
+    status_msg = bot.send_message(
+        msg.chat.id,
+        f"🔄 Validating <b>{total}</b> key(s)…",
+        parse_mode="HTML",
+    )
 
     results_valid   = []
     results_invalid = []
@@ -1286,14 +1384,21 @@ def cmd_massvalidate(msg: Message):
     for i, key in enumerate(keys):
         valid, _, info = validate_key(key, proxy_url=us.proxy_pool.active)
         if valid:
-            results_valid.append(f"  ✅ <code>{html_lib.escape(key)}</code>\n     → {html_lib.escape(info)}")
+            results_valid.append(
+                f"  ✅ <code>{html_lib.escape(key)}</code>\n     → {html_lib.escape(info)}"
+            )
         else:
-            results_invalid.append(f"  ❌ <code>{html_lib.escape(key)}</code>\n     → {html_lib.escape(info)}")
+            results_invalid.append(
+                f"  ❌ <code>{html_lib.escape(key)}</code>\n     → {html_lib.escape(info)}"
+            )
         if (i + 1) % 3 == 0 or i == total - 1:
             try:
                 bot.edit_message_text(
                     f"🔄 Validating… <b>{i+1}/{total}</b>",
-                    chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
+                    chat_id    = status_msg.chat.id,
+                    message_id = status_msg.message_id,
+                    parse_mode = "HTML",
+                )
             except Exception:
                 pass
 
@@ -1314,8 +1419,6 @@ def cmd_massvalidate(msg: Message):
     send_chunked(msg.chat.id, report.strip())
 
 
-# ── New Chat ───────────────────────────────────────────────────────
-
 @bot.message_handler(commands=["newchat"])
 @auth_check
 def cmd_newchat(msg: Message):
@@ -1329,8 +1432,6 @@ def cmd_newchat(msg: Message):
     us.history = []
     bot.reply_to(msg, "🆕 <b>New conversation started!</b>", parse_mode="HTML")
 
-
-# ── Model ──────────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["model"])
 @auth_check
@@ -1352,8 +1453,6 @@ def cmd_model(msg: Message):
     bot.reply_to(msg, f"✅ Model: <code>{us.model}</code>", parse_mode="HTML")
 
 
-# ── Incognito ──────────────────────────────────────────────────────
-
 @bot.message_handler(commands=["incognito"])
 @auth_check
 def cmd_incognito(msg: Message):
@@ -1362,12 +1461,11 @@ def cmd_incognito(msg: Message):
     state        = "ON 🟢" if us.incognito else "OFF 🔴"
     bot.reply_to(msg,
         f"🕵️ Incognito: <b>{state}</b>\n\n"
-        + ("✅ Conversations deleted after each reply." if us.incognito
-           else "⚠️ Conversations kept on claude.ai until /wipe."),
+        + ("✅ Conversations deleted after each reply."
+           if us.incognito else
+           "⚠️ Conversations kept on claude.ai until /wipe."),
         parse_mode="HTML")
 
-
-# ── Web Search ─────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["websearch"])
 @auth_check
@@ -1379,14 +1477,13 @@ def cmd_websearch(msg: Message):
         f"🌐 Web Search: <b>{state}</b>\n\n"
         + (
             "✅ Claude will search the web when needed.\n"
-            "<i>⚠️ Experimental — may not work on all accounts.</i>"
+            "<i>⚠️ Requires web search to be enabled on your Claude account.\n"
+            "Falls back to normal mode if your account doesn't support it.</i>"
             if us.web_search else
             "Claude will answer from training data only."
         ),
         parse_mode="HTML")
 
-
-# ── Wipe ───────────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["wipe"])
 @auth_check
@@ -1399,8 +1496,6 @@ def cmd_wipe(msg: Message):
     wipe_all(us)
     bot.reply_to(msg, f"🧹 Deleted <b>{count}</b> conversation(s).", parse_mode="HTML")
 
-
-# ── Status ─────────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["status"])
 @auth_check
@@ -1418,40 +1513,29 @@ def cmd_status(msg: Message):
         )
 
     bot.reply_to(msg,
-        f"📊 <b>Session Status</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🔑 Key      : {'✅ Set' if us.session_key else '❌ Not set'}\n"
+        f"📊 <b>Session Status</b>\n━━━━━━━━━━━━━━━━━\n"
+        f"🔑 Key       : {'✅ Set' if us.session_key else '❌ Not set'}\n"
         f"🕵️ Incognito : {'🟢 ON' if us.incognito else '🔴 OFF'}\n"
         f"🌐 WebSearch : {'🟢 ON' if us.web_search else '🔴 OFF'}\n"
-        f"🤖 Model    : <code>{us.model}</code>\n"
-        f"💬 Current  : {conv}\n"
-        f"📋 Tracked  : {len(us.tracked_convs)} conv(s)\n"
-        f"💾 History  : {len(us.history)} msg(s)\n"
-        f"🔁 Retry    : up to {RETRY_MAX}x ({RETRY_DELAY}s delay)"
+        f"🤖 Model     : <code>{us.model}</code>\n"
+        f"💬 Current   : {conv}\n"
+        f"📋 Tracked   : {len(us.tracked_convs)} conv(s)\n"
+        f"💾 History   : {len(us.history)} msg(s)\n"
+        f"🔁 Retry     : up to {RETRY_MAX}x ({RETRY_DELAY}s delay)"
         f"{proxy_line}",
         parse_mode="HTML")
 
 
 # ═══════════════════════════════════════════════════════════════════
 #               MEDIA GROUP BUFFER
-#   Telegram sends each photo in a group as a SEPARATE update,
-#   all sharing the same media_group_id. We buffer them for
-#   MEDIA_GROUP_WAIT seconds then fire ONE combined request.
 # ═══════════════════════════════════════════════════════════════════
 
-# Seconds to wait for more photos to arrive in the same group
 MEDIA_GROUP_WAIT = 1.5
-
-# { (user_id, media_group_id): { "msgs": [...], "timer": Timer, "chat_id": int } }
 _media_buffers: dict = {}
-_media_lock           = threading.Lock()
+_media_lock          = threading.Lock()
 
 
 def _flush_media_group(uid: int, group_id: str):
-    """
-    Called after MEDIA_GROUP_WAIT seconds. Collects all buffered
-    messages for this group and fires a single Claude request.
-    """
     with _media_lock:
         key  = (uid, group_id)
         data = _media_buffers.pop(key, None)
@@ -1461,11 +1545,8 @@ def _flush_media_group(uid: int, group_id: str):
 
     msgs    : list[Message] = data["msgs"]
     chat_id : int           = data["chat_id"]
+    first_msg               = msgs[0]
 
-    # Use the first message as the "anchor" for reply
-    first_msg = msgs[0]
-
-    # Collect caption from whichever message has one
     caption = ""
     for m in msgs:
         if m.caption:
@@ -1475,12 +1556,13 @@ def _flush_media_group(uid: int, group_id: str):
     _process_combined(uid, chat_id, first_msg, msgs, caption)
 
 
-def _process_combined(uid: int, chat_id: int, first_msg: Message,
-                      all_msgs: list[Message], user_text: str):
-    """
-    Download all photos/documents from all_msgs, upload images to
-    Claude's file endpoint, combine everything into ONE request.
-    """
+def _process_combined(
+    uid      : int,
+    chat_id  : int,
+    first_msg: Message,
+    all_msgs : list[Message],
+    user_text: str,
+):
     us = get_session(uid)
 
     if not us.session_key or not us.organization_id:
@@ -1495,15 +1577,14 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
             parse_mode="HTML")
         return
 
-    doc_parts = []   # text file contents appended to prompt
-    has_photo = False
+    doc_parts  = []
+    has_photo  = False
+    item_count = len(all_msgs)   # ← FIX: was undefined before
 
     for msg in all_msgs:
-        # ── Photos — not supported ───────────────────────────────
         if msg.photo:
             has_photo = True
 
-        # ── Documents — read as text and append to prompt ────────
         if msg.document:
             try:
                 finfo = bot.get_file(msg.document.file_id)
@@ -1513,26 +1594,28 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
                     content   = fdata.decode("utf-8")
                     doc_parts.append(f"[File: {fname}]\n```\n{content}\n```")
                 except UnicodeDecodeError:
-                    doc_parts.append(f"[Binary file: {fname}, {len(fdata)} bytes — cannot display]")
+                    doc_parts.append(
+                        f"[Binary file: {fname}, {len(fdata)} bytes — cannot display]"
+                    )
                 log.info(f"User {uid}: buffered document {fname}")
             except Exception as e:
                 log.warning(f"Could not process document: {e}")
 
-        # ── Plain text messages in a group ───────────────────────
         if msg.text and not msg.photo and not msg.document:
             if msg.text.strip() and msg.text.strip() != user_text:
                 user_text += "\n" + msg.text.strip()
 
-    # Notify once if photos were sent
     if has_photo:
-        bot.send_message(chat_id,
-            "⚠️ <i>Image sending is not supported via this bot.\nPlease describe what you need in text instead.</i>",
-            parse_mode="HTML",
-            reply_to_message_id=first_msg.message_id)
+        bot.send_message(
+            chat_id,
+            "⚠️ <i>Image sending is not supported via this bot.\n"
+            "Please describe what you need in text instead.</i>",
+            parse_mode           = "HTML",
+            reply_to_message_id  = first_msg.message_id,
+        )
         if not user_text.strip() and not doc_parts:
             return
 
-    # Build the combined prompt
     combined = user_text or ""
     for doc in doc_parts:
         combined += f"\n\n{doc}"
@@ -1540,7 +1623,10 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
     if not combined.strip():
         return
 
-    group_note = f"📎 <i>Grouped {len(doc_parts)} file(s) into one request</i>\n" if len(doc_parts) > 1 else ""
+    group_note = (
+        f"📎 <i>Grouped {len(doc_parts)} file(s) into one request</i>\n"
+        if len(doc_parts) > 1 else ""
+    )
 
     us.busy  = True
     thinking = bot.send_message(
@@ -1557,8 +1643,12 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
         files     = result["files"]
 
         if not resp_text.strip():
-            bot.edit_message_text("⚠️ <i>Empty response from Claude.</i>",
-                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
+            bot.edit_message_text(
+                "⚠️ <i>Empty response from Claude.</i>",
+                chat_id    = thinking.chat.id,
+                message_id = thinking.message_id,
+                parse_mode = "HTML",
+            )
             return
 
         try:
@@ -1572,28 +1662,39 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
             send_files(chat_id, files, reply_to=first_msg.message_id)
 
         us.history.append({"role": "user",      "text": combined[:200]})
-        us.history.append({"role": "assistant", "text": resp_text[:200]})
-        log.info(f"User {uid} → {len(resp_text)} chars, {len(files)} file(s), {item_count} media item(s)")
+        us.history.append({"role": "assistant",  "text": resp_text[:200]})
+        log.info(
+            f"User {uid} → {len(resp_text)} chars, "
+            f"{len(files)} file(s), {item_count} media item(s)"
+        )
 
     except RuntimeError as e:
         try:
             bot.edit_message_text(
                 f"❌ <b>Error:</b>\n<code>{html_lib.escape(str(e))}</code>",
-                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
+                chat_id    = thinking.chat.id,
+                message_id = thinking.message_id,
+                parse_mode = "HTML",
+            )
         except Exception:
             bot.send_message(chat_id, f"❌ {e}")
 
     except requests.exceptions.HTTPError as e:
-        code = e.response.status_code if e.response is not None else "?"
+        code     = e.response.status_code if e.response is not None else "?"
         msgs_map = {
+            400: "🔧 Bad request — API format may have changed. Check logs.",
             403: "🔑 Key expired or IP blocked.\n• /validate to check\n• /addproxy to add proxy",
-            429: f"⏳ Rate limited. Retried {RETRY_MAX}x — still blocked.\nWait a few minutes or add more proxies with /addproxy.",
+            429: f"⏳ Rate limited. Retried {RETRY_MAX}x.\nWait a few minutes or /addproxy.",
             500: "💥 Claude server error. Try again later.",
         }
         err = msgs_map.get(code, f"HTTP {code} error")
         try:
-            bot.edit_message_text(f"❌ <b>Error {code}:</b>\n{err}",
-                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
+            bot.edit_message_text(
+                f"❌ <b>Error {code}:</b>\n{err}",
+                chat_id    = thinking.chat.id,
+                message_id = thinking.message_id,
+                parse_mode = "HTML",
+            )
         except Exception:
             bot.send_message(chat_id, f"❌ HTTP {code}: {err}", parse_mode="HTML")
 
@@ -1602,7 +1703,10 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
         try:
             bot.edit_message_text(
                 f"❌ <b>Unexpected error:</b>\n<code>{html_lib.escape(str(e))}</code>",
-                chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
+                chat_id    = thinking.chat.id,
+                message_id = thinking.message_id,
+                parse_mode = "HTML",
+            )
         except Exception:
             pass
     finally:
@@ -1621,7 +1725,7 @@ def handle_message(msg: Message):
 
     if not us.session_key or not us.organization_id:
         bot.reply_to(msg,
-            "⚠️ <b>No session key!</b>\n\nUse /setkey <code>&lt;key&gt;</code> first.\nSee /help for instructions.",
+            "⚠️ <b>No session key!</b>\n\nUse /setkey <code>&lt;key&gt;</code> first.",
             parse_mode="HTML")
         return
 
@@ -1629,12 +1733,10 @@ def handle_message(msg: Message):
         bot.reply_to(msg, "⏳ <i>Still processing previous message…</i>", parse_mode="HTML")
         return
 
-    # ── Media group: buffer and wait for all photos to arrive ────
     if msg.media_group_id:
         key = (uid, msg.media_group_id)
         with _media_lock:
             if key not in _media_buffers:
-                # First message of this group — start a timer
                 timer = threading.Timer(
                     MEDIA_GROUP_WAIT,
                     _flush_media_group,
@@ -1646,12 +1748,8 @@ def handle_message(msg: Message):
                     "chat_id": msg.chat.id,
                 }
                 timer.start()
-                log.debug(f"Media group {msg.media_group_id}: started buffer (user {uid})")
             else:
-                # Additional photo in the same group — add and reset timer
                 _media_buffers[key]["msgs"].append(msg)
-                # Cancel old timer and start a fresh one so we always
-                # wait MEDIA_GROUP_WAIT after the LAST photo arrives
                 _media_buffers[key]["timer"].cancel()
                 timer = threading.Timer(
                     MEDIA_GROUP_WAIT,
@@ -1660,13 +1758,8 @@ def handle_message(msg: Message):
                 )
                 _media_buffers[key]["timer"] = timer
                 timer.start()
-                log.debug(
-                    f"Media group {msg.media_group_id}: "
-                    f"{len(_media_buffers[key]['msgs'])} items buffered"
-                )
-        return  # Don't process yet — wait for the timer
+        return
 
-    # ── Single message (text, single photo, or document) ─────────
     _process_combined(uid, msg.chat.id, msg, [msg], msg.text or msg.caption or "")
 
 
@@ -1675,7 +1768,7 @@ def handle_message(msg: Message):
 # ═══════════════════════════════════════════════════════════════════
 
 def graceful_shutdown(sig, frame):
-    log.info("Shutdown — cleaning up conversations…")
+    log.info("Shutdown — cleaning up…")
     wiped = 0
     for uid, us in sessions.items():
         if us.tracked_convs:
@@ -1704,7 +1797,7 @@ def main():
             BotCommand("validate",      "Check if key still works"),
             BotCommand("massvalidate",  "Bulk validate multiple keys"),
             BotCommand("incognito",     "Toggle incognito mode"),
-            BotCommand("websearch",     "Toggle web search (experimental)"),
+            BotCommand("websearch",     "Toggle web search"),
             BotCommand("wipe",          "Delete all tracked conversations"),
             BotCommand("status",        "Show session info"),
             BotCommand("myid",          "Get your Telegram user ID"),
