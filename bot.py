@@ -449,96 +449,6 @@ def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]
         return False, "", str(e)
 
 
-def upload_image(us: UserSession, image_data: bytes, filename: str = "image.jpg") -> Optional[dict]:
-    """
-    Upload an image to Claude's file upload endpoint.
-    Endpoint: POST /api/organizations/{org_id}/conversations/{conv_id}/wiggle/upload-file
-    Must be called AFTER a conversation is created.
-    Returns the attachment dict or None on failure.
-    """
-    # Detect mime type from magic bytes
-    mime = "image/jpeg"
-    if image_data[:8] == b'\x89PNG\r\n\x1a\n':
-        mime     = "image/png"
-        filename = re.sub(r'\.\w+$', '.png', filename)
-    elif image_data[:6] in (b'GIF87a', b'GIF89a'):
-        mime     = "image/gif"
-        filename = re.sub(r'\.\w+$', '.gif', filename)
-    elif b'WEBP' in image_data[:12]:
-        mime     = "image/webp"
-        filename = re.sub(r'\.\w+$', '.webp', filename)
-
-    if not us.conversation_id:
-        log.warning("upload_image called before conversation created")
-        return None
-
-    url = (
-        f"{BASE_URL}/organizations/{us.organization_id}"
-        f"/conversations/{us.conversation_id}/wiggle/upload-file"
-    )
-
-    # Remove Content-Type so requests sets multipart boundary automatically
-    orig_ct = us.http.headers.pop("Content-Type", "application/json")
-
-    try:
-        resp = us.http.post(
-            url,
-            files   = {"file": (filename, io.BytesIO(image_data), mime)},
-            timeout = 30,
-        )
-
-        log.debug(f"Image upload → HTTP {resp.status_code}")
-
-        if resp.status_code not in (200, 201):
-            log.warning(f"Image upload failed HTTP {resp.status_code}: {resp.text[:200]}")
-            return None
-
-        raw = resp.text.strip()
-        log.info(f"Image upload raw response: '{raw[:300]}'")
-
-        if not raw:
-            log.warning("Image upload: empty response body")
-            return None
-
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError as e:
-            log.warning(f"Image upload: non-JSON response ({e}): '{raw[:300]}'")
-            return None
-
-        log.debug(f"Upload response: {result}")
-
-        # Extract file identifier from response
-        file_uuid = (
-            result.get("file_uuid") or
-            result.get("id")        or
-            result.get("uuid")      or
-            result.get("file_id")   or
-            (result.get("file", {}) or {}).get("id") or
-            (result.get("file", {}) or {}).get("uuid")
-        )
-
-        if not file_uuid:
-            log.warning(f"Upload OK but no file identifier in response: {result}")
-            return None
-
-        log.info(f"Image uploaded ✓ uuid={str(file_uuid)[:16]}… ({len(image_data)}B)")
-
-        return {
-            "file_name"        : filename,
-            "file_type"        : mime,
-            "file_size"        : len(image_data),
-            "extracted_content": "",
-            "file_uuid"        : file_uuid,
-        }
-
-    except Exception as e:
-        log.warning(f"Image upload error: {e}")
-        return None
-    finally:
-        us.http.headers["Content-Type"] = orig_ct
-
-
 def create_conversation(us: UserSession) -> str:
     """Create a new blank conversation."""
     url = f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations"
@@ -1562,38 +1472,13 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
             parse_mode="HTML")
         return
 
-    attachments = []   # proper file attachment dicts (images uploaded via API)
-    doc_parts   = []   # text file contents appended to prompt
-    failed_imgs = 0
-
-    # ── Create conversation first (upload endpoint needs conv_id) ─
-    if not us.conversation_id:
-        try:
-            create_conversation(us)
-        except Exception as e:
-            bot.send_message(chat_id,
-                f"❌ <b>Failed to create conversation:</b>\n<code>{html_lib.escape(str(e))}</code>",
-                parse_mode="HTML")
-            us.busy = False
-            return
+    doc_parts = []   # text file contents appended to prompt
+    has_photo = False
 
     for msg in all_msgs:
-        # ── Photos — upload to Claude's file endpoint ────────────
+        # ── Photos — not supported ───────────────────────────────
         if msg.photo:
-            try:
-                finfo     = bot.get_file(msg.photo[-1].file_id)
-                fdata     = bot.download_file(finfo.file_path)
-                fname     = f"image_{len(attachments)+1}.jpg"
-                attachment = upload_image(us, fdata, fname)
-                if attachment:
-                    attachments.append(attachment)
-                    log.info(f"User {uid}: image uploaded OK → {attachment['file_uuid'][:16]}")
-                else:
-                    failed_imgs += 1
-                    log.warning(f"User {uid}: image upload failed, skipping")
-            except Exception as e:
-                failed_imgs += 1
-                log.warning(f"Could not process photo: {e}")
+            has_photo = True
 
         # ── Documents — read as text and append to prompt ────────
         if msg.document:
@@ -1601,17 +1486,6 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
                 finfo = bot.get_file(msg.document.file_id)
                 fdata = bot.download_file(finfo.file_path)
                 fname = msg.document.file_name or "file"
-
-                # Try as image first if it's an image document
-                img_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
-                if any(fname.lower().endswith(ext) for ext in img_exts):
-                    attachment = upload_image(us, fdata, fname)
-                    if attachment:
-                        attachments.append(attachment)
-                        log.info(f"User {uid}: image-doc uploaded OK")
-                        continue
-
-                # Otherwise treat as text file
                 try:
                     content   = fdata.decode("utf-8")
                     doc_parts.append(f"[File: {fname}]\n```\n{content}\n```")
@@ -1626,27 +1500,24 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
             if msg.text.strip() and msg.text.strip() != user_text:
                 user_text += "\n" + msg.text.strip()
 
-    # Build the combined prompt text
+    # Notify once if photos were sent
+    if has_photo:
+        bot.send_message(chat_id,
+            "⚠️ <i>Image sending is not supported via this bot.\nPlease describe what you need in text instead.</i>",
+            parse_mode="HTML",
+            reply_to_message_id=first_msg.message_id)
+        if not user_text.strip() and not doc_parts:
+            return
+
+    # Build the combined prompt
     combined = user_text or ""
     for doc in doc_parts:
         combined += f"\n\n{doc}"
 
-    # If no prompt text but we have images, add a default instruction
-    if not combined.strip() and attachments:
-        combined = "Please describe and analyze the attached image(s)."
-
-    if not combined.strip() and not attachments:
+    if not combined.strip():
         return
 
-    # Status note
-    item_count = len(attachments) + len(doc_parts)
-    if item_count > 1:
-        group_note = f"📎 <i>Grouped {item_count} item(s) into one request</i>\n"
-    else:
-        group_note = ""
-
-    if failed_imgs > 0:
-        group_note += f"⚠️ <i>{failed_imgs} image(s) failed to upload</i>\n"
+    group_note = f"📎 <i>Grouped {len(doc_parts)} file(s) into one request</i>\n" if len(doc_parts) > 1 else ""
 
     us.busy  = True
     thinking = bot.send_message(
@@ -1658,7 +1529,7 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
     bot.send_chat_action(chat_id, "typing")
 
     try:
-        result    = send_message(us, combined, attachments, status_msg=thinking, chat_id=chat_id)
+        result    = send_message(us, combined, [], status_msg=thinking, chat_id=chat_id)
         resp_text = result["text"]
         files     = result["files"]
 
