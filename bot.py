@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""
+🕵️ Claude Incognito Telegram Bot
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Docker-ready — all config hardcoded below.
+⚠️ UNOFFICIAL — Uses claude.ai web API. May break at any time.
+
+PROXY COMMANDS (manage from bot — no code changes needed):
+  /addproxy http://user:pass@host:port   — add proxy to pool
+  /proxies                               — list all proxies + active one
+  /delproxy 2                            — remove proxy #2
+  /clearproxies                          — remove all proxies
+  /proxystatus                           — show active proxy + exit IP
+  /nextproxy                             — manually rotate to next proxy
+"""
+
 import json
 import uuid
 import re
