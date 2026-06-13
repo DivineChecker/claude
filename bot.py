@@ -32,7 +32,13 @@ from collections import defaultdict
 
 import requests
 from telebot import TeleBot, apihelper
-from telebot.types import Message, BotCommand
+from telebot.types import Message, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+
+try:
+    from pypdf import PdfReader
+    PYPDF_AVAILABLE = True
+except ImportError:
+    PYPDF_AVAILABLE = False
 
 # ═══════════════════════════════════════════════════════════════════
 #                        !! CONFIGURATION !!
@@ -101,6 +107,7 @@ log.info(f"Admins     : {ADMIN_IDS or 'Everyone'}")
 log.info(f"LogLevel   : {LOG_LEVEL}")
 log.info(f"RetryMax   : {RETRY_MAX}x  RetryDelay: {RETRY_DELAY}s")
 log.info(f"DefProxies : {len(DEFAULT_PROXIES)}")
+log.info(f"PDF support: {'✅ pypdf available' if PYPDF_AVAILABLE else '❌ pypdf NOT installed — PDFs will be skipped'}")
 
 bot = TeleBot(BOT_TOKEN, parse_mode="HTML")
 
@@ -242,6 +249,7 @@ class UserSession:
     model           : str        = field(default_factory=lambda: DEFAULT_MODEL)
     tracked_convs   : list       = field(default_factory=list)
     history         : list       = field(default_factory=list)
+    pending_history : list       = field(default_factory=list)  # old history offered for resume
     http            : requests.Session = field(default_factory=requests.Session)
     incognito       : bool       = True
     busy            : bool       = False
@@ -401,9 +409,11 @@ def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]
         resp = s.get(f"{BASE_URL}/organizations", timeout=15)
 
         if resp.status_code == 403:
-            return False, "", "Expired/Invalid key — or VPS IP blocked (use /addproxy)"
+            return False, "", "Session expired or invalid — log in to claude.ai again for a fresh key (or IP blocked, try /addproxy)"
         if resp.status_code == 401:
-            return False, "", "Unauthorized / Invalid Key"
+            return False, "", "Unauthorized — key is invalid or has been revoked"
+        if resp.status_code == 429:
+            return False, "", "Account rate-limited — usage limit reached, wait for reset or use a different account"
 
         resp.raise_for_status()
         orgs = resp.json()
@@ -533,6 +543,26 @@ def send_message(us: UserSession, text: str, attachments: list = None, status_ms
             # ── 429 Rate Limited ──────────────────────────────────
             if resp.status_code == 429:
                 log.warning(f"429 rate limit on attempt {attempt}/{RETRY_MAX}")
+
+                # Try to extract reset time from response body
+                reset_info = ""
+                try:
+                    body = json.loads(resp.text)
+                    err  = body.get("error", {})
+                    msg_text = err.get("message", "") or body.get("message", "")
+                    # Claude returns resets_at as unix timestamp sometimes
+                    resets_at = err.get("resets_at") or body.get("resets_at")
+                    if resets_at:
+                        try:
+                            reset_dt = time.strftime("%H:%M UTC", time.gmtime(float(resets_at)))
+                            reset_info = f" (resets at {reset_dt})"
+                        except Exception:
+                            pass
+                    if msg_text:
+                        log.warning(f"429 detail: {msg_text}")
+                except Exception:
+                    pass
+
                 if attempt < RETRY_MAX:
                     wait = retry_delay * attempt
                     log.info(f"Waiting {wait}s before retry…")
@@ -553,6 +583,7 @@ def send_message(us: UserSession, text: str, attachments: list = None, status_ms
                         log.info(f"Rotated proxy after 429: {_mask_proxy(new_proxy)}")
                     continue
                 last_error = requests.exceptions.HTTPError(response=resp, request=resp.request)
+                last_error.reset_info = reset_info
                 break
 
             # ── 403 Forbidden ─────────────────────────────────────
@@ -654,6 +685,40 @@ def send_message(us: UserSession, text: str, attachments: list = None, status_ms
     if last_error:
         raise last_error
     raise RuntimeError("Failed after all retries")
+
+
+def extract_pdf_text(pdf_data: bytes, max_chars: int = 50000) -> str:
+    """
+    Extract text content from a PDF file's bytes.
+    Returns extracted text (truncated to max_chars) or an error message.
+    """
+    if not PYPDF_AVAILABLE:
+        return "[PDF received but pypdf is not installed on the server — cannot extract text]"
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_data))
+        pages  = []
+        for i, page in enumerate(reader.pages):
+            try:
+                text = page.extract_text() or ""
+            except Exception as e:
+                text = f"[Error extracting page {i+1}: {e}]"
+            if text.strip():
+                pages.append(f"--- Page {i+1} ---\n{text.strip()}")
+
+        full_text = "\n\n".join(pages)
+
+        if not full_text.strip():
+            return "[PDF appears to contain no extractable text — may be scanned/image-based]"
+
+        if len(full_text) > max_chars:
+            full_text = full_text[:max_chars] + f"\n\n[...truncated, PDF has {len(reader.pages)} pages total...]"
+
+        return full_text
+
+    except Exception as e:
+        log.warning(f"PDF extraction error: {e}")
+        return f"[Could not read PDF: {e}]"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -897,7 +962,6 @@ Just send any message! Files and images supported.
 
 <b>━━━ Controls ━━━</b>
 /newchat — Start fresh conversation
-/model — Change Claude model
 /incognito — Toggle incognito mode
 /websearch — Toggle web search (experimental)
 /wipe — Delete all tracked chats
@@ -965,8 +1029,16 @@ def cmd_setkey(msg: Message):
             parse_mode="HTML")
         return
 
-    if us.organization_id and us.organization_id != org_id:
-        wipe_all(us)
+    org_switched = bool(us.organization_id and us.organization_id != org_id)
+    had_history  = len(us.history) > 0
+
+    if org_switched:
+        if had_history:
+            # Save old history for possible resume, wipe old org's conversations
+            us.pending_history = list(us.history)
+            wipe_all(us)
+        else:
+            wipe_all(us)
 
     us.set_key(key)
     us.organization_id = org_id
@@ -986,8 +1058,72 @@ def cmd_setkey(msg: Message):
         f"<i>🔐 Key message deleted for security.</i>",
         parse_mode="HTML")
 
+    # Offer to resume previous conversation if we have saved history
+    if org_switched and had_history:
+        kb = InlineKeyboardMarkup()
+        kb.row(
+            InlineKeyboardButton("✅ Yes, continue", callback_data="resume_yes"),
+            InlineKeyboardButton("🆕 No, start fresh", callback_data="resume_no"),
+        )
+        bot.send_message(
+            msg.chat.id,
+            f"💬 <b>New session key detected for a different account.</b>\n\n"
+            f"You have <b>{len(us.pending_history)}</b> message(s) from your previous "
+            f"project/conversation.\n\n"
+            f"Do you want to <b>continue your previous project</b> with this new key?\n\n"
+            f"<i>⚠️ Continuing will resend the full previous conversation as context "
+            f"on your next message — this uses more tokens.</i>",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
 
-# ── Proxy Pool Commands ────────────────────────────────────────────
+
+# ── Resume Prompt Callback ──────────────────────────────────────────
+
+@bot.callback_query_handler(func=lambda call: call.data in ("resume_yes", "resume_no"))
+def cb_resume(call: CallbackQuery):
+    uid = call.from_user.id
+    us  = get_session(uid)
+
+    if call.data == "resume_yes":
+        if not us.pending_history:
+            bot.answer_callback_query(call.id, "No previous history found.")
+            try:
+                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        us.history = list(us.pending_history)
+        us.pending_history = []
+        bot.answer_callback_query(call.id, "Resuming previous project…")
+
+        try:
+            bot.edit_message_text(
+                "✅ <b>Resuming previous project!</b>\n\n"
+                "Your next message will include the full previous conversation as context.",
+                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        log.info(f"User {uid} chose to resume previous project ({len(us.history)} history msg(s))")
+
+    else:  # resume_no
+        us.pending_history = []
+        bot.answer_callback_query(call.id, "Starting fresh.")
+        try:
+            bot.edit_message_text(
+                "🆕 <b>Starting fresh!</b>\n\nPrevious conversation history discarded.",
+                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        log.info(f"User {uid} chose to start fresh, discarded pending history")
+
+
+
 
 @bot.message_handler(commands=["addproxy"])
 @auth_check
@@ -1328,28 +1464,6 @@ def cmd_newchat(msg: Message):
     bot.reply_to(msg, "🆕 <b>New conversation started!</b>", parse_mode="HTML")
 
 
-# ── Model ──────────────────────────────────────────────────────────
-
-@bot.message_handler(commands=["model"])
-@auth_check
-def cmd_model(msg: Message):
-    parts = msg.text.split(maxsplit=1)
-    us    = get_session(msg.from_user.id)
-    if len(parts) < 2:
-        bot.reply_to(msg,
-            f"🤖 Current: <code>{us.model}</code>\n\n"
-            "<b>Available:</b>\n"
-            "• <code>claude-sonnet-4-20250514</code> (latest)\n"
-            "• <code>claude-3-5-sonnet-20241022</code>\n"
-            "• <code>claude-3-5-haiku-20241022</code> (fast)\n"
-            "• <code>claude-3-opus-20240229</code>\n\n"
-            "Usage: /model <code>&lt;model_name&gt;</code>",
-            parse_mode="HTML")
-        return
-    us.model = parts[1].strip()
-    bot.reply_to(msg, f"✅ Model: <code>{us.model}</code>", parse_mode="HTML")
-
-
 # ── Incognito ──────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["incognito"])
@@ -1461,12 +1575,21 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
                 finfo = bot.get_file(msg.document.file_id)
                 fdata = bot.download_file(finfo.file_path)
                 fname = msg.document.file_name or "file"
-                try:
-                    content = fdata.decode("utf-8")
-                    doc_parts.append(f"[File: {fname}]\n```\n{content}\n```")
-                except UnicodeDecodeError:
-                    doc_parts.append(f"[Binary file: {fname}, {len(fdata)} bytes — cannot display]")
-                log.info(f"User {uid}: loaded document {fname}")
+                mime  = (msg.document.mime_type or "").lower()
+
+                is_pdf = fname.lower().endswith(".pdf") or mime == "application/pdf"
+
+                if is_pdf:
+                    pdf_text = extract_pdf_text(fdata)
+                    doc_parts.append(f"[PDF: {fname}]\n{pdf_text}")
+                    log.info(f"User {uid}: extracted PDF {fname} ({len(fdata)} bytes)")
+                else:
+                    try:
+                        content = fdata.decode("utf-8")
+                        doc_parts.append(f"[File: {fname}]\n```\n{content}\n```")
+                    except UnicodeDecodeError:
+                        doc_parts.append(f"[Binary file: {fname}, {len(fdata)} bytes — cannot display]")
+                    log.info(f"User {uid}: loaded document {fname}")
             except Exception as e:
                 log.warning(f"Could not process document: {e}")
 
@@ -1493,6 +1616,16 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
 
     if not combined.strip():
         return
+
+    # ── Replay resumed history as context (one-time, on first message) ─
+    if us.history and not us.conversation_id:
+        replay_lines = ["[Continuing previous conversation — context below]\n"]
+        for h in us.history:
+            role = "User" if h["role"] == "user" else "Claude"
+            replay_lines.append(f"{role}: {h['text']}")
+        replay_lines.append("\n[New message]")
+        combined = "\n".join(replay_lines) + "\n" + combined
+        log.info(f"User {uid}: replaying {len(us.history)} history msg(s) into new conversation")
 
     group_note = f"📎 <i>Grouped {len(doc_parts)} file(s) into one request</i>\n" if len(doc_parts) > 1 else ""
 
@@ -1539,17 +1672,39 @@ def _process_combined(uid: int, chat_id: int, first_msg: Message,
 
     except requests.exceptions.HTTPError as e:
         code = e.response.status_code if e.response is not None else "?"
-        msgs_map = {
-            403: "🔑 Key expired or IP blocked.\n• /validate to check\n• /addproxy to add proxy",
-            429: f"⏳ Rate limited. Retried {RETRY_MAX}x — still blocked.\nWait a few minutes or add more proxies with /addproxy.",
-            500: "💥 Claude server error. Try again later.",
-        }
-        err = msgs_map.get(code, f"HTTP {code} error")
+
+        if code == 403:
+            err = (
+                "🔑 <b>Session key expired or invalid.</b>\n\n"
+                "Your claude.ai session has likely logged out or the key was revoked.\n\n"
+                "<b>Fix:</b>\n"
+                "1. Open claude.ai in your browser and log in again\n"
+                "2. Get a fresh <code>sessionKey</code> cookie\n"
+                "3. Run /setkey with the new key\n\n"
+                "If you're on a VPS, this could also mean your IP got blocked — "
+                "try /validate first, and /addproxy if needed."
+            )
+        elif code == 429:
+            reset_info = getattr(e, "reset_info", "") or ""
+            err = (
+                f"⏳ <b>Claude usage limit reached{reset_info}.</b>\n\n"
+                f"This account has hit its message limit for the current window. "
+                f"Retried {RETRY_MAX}x with proxy rotation — still limited.\n\n"
+                "<b>Options:</b>\n"
+                "• Wait for the limit to reset (usually a few hours for free accounts)\n"
+                "• Switch to a different account with /setkey\n"
+                "• Add more proxies with /addproxy to spread requests across IPs"
+            )
+        elif code == 500:
+            err = "💥 Claude server error. Try again in a moment."
+        else:
+            err = f"HTTP {code} error from Claude."
+
         try:
-            bot.edit_message_text(f"❌ <b>Error {code}:</b>\n{err}",
+            bot.edit_message_text(f"❌ <b>Error {code}</b>\n\n{err}",
                 chat_id=thinking.chat.id, message_id=thinking.message_id, parse_mode="HTML")
         except Exception:
-            bot.send_message(chat_id, f"❌ HTTP {code}: {err}", parse_mode="HTML")
+            bot.send_message(chat_id, f"❌ Error {code}: {err}", parse_mode="HTML")
 
     except Exception as e:
         log.exception(f"Unhandled error for user {uid}")
@@ -1616,7 +1771,6 @@ def main():
             BotCommand("start",         "Welcome & help"),
             BotCommand("setkey",        "Set Claude session key"),
             BotCommand("newchat",       "Start fresh conversation"),
-            BotCommand("model",         "Change Claude model"),
             BotCommand("validate",      "Check if key still works"),
             BotCommand("massvalidate",  "Bulk validate multiple keys"),
             BotCommand("incognito",     "Toggle incognito mode"),
