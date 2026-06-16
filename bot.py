@@ -425,27 +425,6 @@ def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]
         org_name = orgs[0].get("name", "Unknown Org")
         org_id   = orgs[0]["uuid"]
 
-        # Also test chat_conversations endpoint
-        conv_resp = s.post(
-            f"{BASE_URL}/organizations/{org_id}/chat_conversations",
-            json    = {"uuid": str(uuid.uuid4()), "name": "", "model": DEFAULT_MODEL},
-            timeout = 15,
-        )
-
-        if conv_resp.status_code == 403:
-            return False, "", "Key valid for auth but blocked for chat (403) — IP may be blocked, add a proxy"
-
-        if conv_resp.status_code not in (200, 201):
-            return False, "", f"Cannot create conversations (HTTP {conv_resp.status_code})"
-
-        # Clean up test conversation
-        test_id = conv_resp.json().get("uuid")
-        if test_id:
-            try:
-                s.delete(f"{BASE_URL}/organizations/{org_id}/chat_conversations/{test_id}", timeout=5)
-            except Exception:
-                pass
-
         log.info(f"Key validated ✓ Org: {org_name}")
         return True, org_id, org_name
 
