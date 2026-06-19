@@ -441,11 +441,23 @@ def validate_key(session_key: str, proxy_url: str = "") -> tuple[bool, str, str]
 def create_conversation(us: UserSession) -> str:
     """Create a new blank conversation."""
     url = f"{BASE_URL}/organizations/{us.organization_id}/chat_conversations"
-    resp = us.http.post(
-        url,
-        json    = {"uuid": str(uuid.uuid4()), "name": "", "model": us.model},
-        timeout = 15,
-    )
+
+    payload = {"uuid": str(uuid.uuid4()), "name": ""}
+    if us.model:
+        payload["model"] = us.model
+
+    resp = us.http.post(url, json=payload, timeout=15)
+
+    if resp.status_code == 400:
+        log.error(f"create_conversation 400 body: {resp.text[:500]}")
+        # Retry once without the model field — claude.ai may reject unknown model strings
+        if "model" in payload:
+            log.info("Retrying conversation creation without 'model' field...")
+            payload.pop("model")
+            resp = us.http.post(url, json=payload, timeout=15)
+            if resp.status_code == 400:
+                log.error(f"create_conversation 400 body (retry): {resp.text[:500]}")
+
     resp.raise_for_status()
     cid = resp.json()["uuid"]
     us.conversation_id = cid
@@ -603,6 +615,12 @@ def send_message(us: UserSession, text: str, attachments: list = None, status_ms
                             continue
                 last_error = requests.exceptions.HTTPError(response=resp, request=resp.request)
                 break
+
+            if resp.status_code == 400:
+                try:
+                    log.error(f"completion 400 body: {resp.text[:500]}")
+                except Exception:
+                    pass
 
             resp.raise_for_status()
 
