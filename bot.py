@@ -625,19 +625,42 @@ def send_message(us: UserSession, text: str, attachments: list = None, status_ms
             resp.raise_for_status()
 
             # ── Stream response ───────────────────────────────────
-            full_text = ""
+            full_text  = ""
+            raw_events = []
             for line in resp.iter_lines(decode_unicode=True):
                 if not line or not line.startswith("data: "):
                     continue
+                raw = line[6:]
                 try:
-                    event = json.loads(line[6:])
-                    etype = event.get("type", "")
-                    if etype == "completion":
-                        full_text += event.get("completion", "")
-                    elif etype == "error":
-                        raise RuntimeError(event.get("error", {}).get("message", "Unknown error"))
+                    event = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
+
+                if len(raw_events) < 10:
+                    raw_events.append(event)
+
+                etype = event.get("type", "")
+
+                # Legacy format: {"type": "completion", "completion": "..."}
+                if etype == "completion":
+                    full_text += event.get("completion", "")
+
+                # Current format: content_block_delta with text_delta
+                elif etype == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        full_text += delta.get("text", "")
+
+                # Alternate: message_delta / message events sometimes carry text directly
+                elif etype in ("message_delta", "message_start", "message_stop"):
+                    pass  # metadata only, no text
+
+                elif etype == "error":
+                    err = event.get("error", {})
+                    raise RuntimeError(err.get("message", "Unknown error"))
+
+            if not full_text:
+                log.warning(f"Empty response — first events seen: {json.dumps(raw_events)[:1000]}")
 
             # ── Success ───────────────────────────────────────────
             us.proxy_pool.mark_success(current_proxy)
