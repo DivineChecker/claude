@@ -45,7 +45,7 @@ except ImportError:
 #              Edit these values before building/running
 # ═══════════════════════════════════════════════════════════════════
 
-BOT_TOKEN     = "8891866405:AAHb_67CJmrBbco3ag425qBfC8EprCjx9cU"
+BOT_TOKEN     = "8891866405:AAH0QXrqoDy-N4FN5FTrN6r-XazTR7Kb1AU"
 
 # Allowed Telegram user IDs — leave empty list [] to allow everyone
 ADMIN_IDS     = []                          # e.g. [123456789, 987654321]
